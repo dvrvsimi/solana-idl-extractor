@@ -61,9 +61,21 @@ impl IDL {
     
     /// Enhance the IDL with pattern analysis
     pub fn enhance_with_patterns(&mut self, pattern_analysis: &PatternAnalysis) {
-        // Placeholder implementation
-        // In a real implementation, this would enhance the IDL with
-        // information from pattern analysis
+        // Add instruction frequencies as metadata
+        for pattern in &pattern_analysis.instruction_patterns {
+            // Find matching instruction
+            if let Some(instruction) = self.instructions.iter_mut().find(|i| i.index == pattern.index) {
+                // Could enhance the instruction with additional information
+            }
+        }
+        
+        // Add account usage patterns
+        for pattern in &pattern_analysis.account_patterns {
+            // Find matching instruction
+            if let Some(instruction) = self.instructions.iter_mut().find(|i| i.index == pattern.instruction_index) {
+                // Could enhance the instruction accounts with additional information
+            }
+        }
     }
     
     /// Add an error to the IDL

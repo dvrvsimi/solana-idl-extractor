@@ -20,9 +20,9 @@ pub fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey) -> R
         return Ok(Vec::new());
     }
     
-    // Limit to the most recent 100 transactions
+    // Limit to the most recent 10 transactions for simplicity
     let signatures: Vec<_> = signatures.iter()
-        .take(100)
+        .take(10)
         .map(|sig_info| sig_info.signature.clone())
         .collect();
     
@@ -30,10 +30,11 @@ pub fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey) -> R
     let mut transactions = Vec::new();
     
     for signature in signatures {
-        if let Ok(tx) = rpc_client.get_transaction(&signature, UiTransactionEncoding::Base64) {
-            if let Some(tx) = tx.transaction {
-                transactions.push(tx);
-            }
+        // Convert string signature to Signature type
+        let sig = solana_sdk::signature::Signature::from_str(&signature)?;
+        
+        if let Ok(tx) = rpc_client.get_transaction(&sig, UiTransactionEncoding::Base64) {
+            transactions.push(tx.transaction.unwrap_or_default());
         }
     }
     

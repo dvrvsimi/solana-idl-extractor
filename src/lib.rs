@@ -27,11 +27,11 @@ pub async fn extract_idl(
     // Analyze program bytecode
     let bytecode_analysis = analyzer.analyze_bytecode(program_id, &monitor).await?;
     
-    // Monitor transactions to extract patterns
-    let transaction_analysis = monitor.analyze_transactions(program_id).await?;
+    // Analyze transaction patterns
+    let pattern_analysis = analyzer.analyze_patterns(program_id, &monitor).await?;
     
     // Combine analyses to build the IDL model
-    let idl = analyzer.build_idl(program_id, bytecode_analysis, transaction_analysis)?;
+    let idl = analyzer.build_idl(program_id, bytecode_analysis, pattern_analysis)?;
     
     // Generate and save the IDL if output path is provided
     if let Some(path) = output_path {

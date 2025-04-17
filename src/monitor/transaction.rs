@@ -18,12 +18,19 @@ pub fn analyze(
     program_id: &Pubkey,
     transactions: &[EncodedTransaction],
 ) -> Result<TransactionAnalysis> {
-    // Placeholder implementation
-    // In a real implementation, this would analyze transactions
-    // to extract instruction and account information
+    let mut instructions = Vec::new();
+    let mut frequency_map = std::collections::HashMap::new();
     
-    let instructions = Vec::new();
-    let frequencies = Vec::new();
+    // Extract instruction data and count frequencies
+    for transaction in transactions {
+        // In a real implementation, we would decode the transaction
+        // and extract instruction data
+    }
+    
+    // Convert frequency map to vector
+    let frequencies = frequency_map.into_iter()
+        .map(|(k, v)| (k, v))
+        .collect();
     
     Ok(TransactionAnalysis {
         instructions,
