@@ -2,9 +2,10 @@
 
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
-use solana_transaction_status::UiTransactionEncoding;
+use solana_transaction_status::{UiTransactionEncoding, TransactionBinaryEncoding, UiMessage, UiInstruction};
 use crate::models::instruction::Instruction;
 use log;
+use std::str::FromStr;
 
 /// Results of pattern analysis
 pub struct PatternAnalysis {
@@ -65,9 +66,9 @@ pub fn extract_instruction_data(
         match transaction {
             solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
                 // Process JSON-encoded transaction
-                if let Some(message) = &ui_transaction.message {
+                if let Some(ui_message) = &ui_transaction.message {
                     // Extract instructions
-                    if let Some(instructions) = &message.instructions {
+                    if let Some(instructions) = &ui_message.instructions {
                         for instruction in instructions {
                             // Check if this instruction is for our program
                             if let Some(program_id_str) = &instruction.program_id {
@@ -84,10 +85,13 @@ pub fn extract_instruction_data(
                                                 log::debug!("Failed to decode base58 data: {}", err);
                                                 
                                                 // Try base64 decoding as fallback
-                                                if let Ok(data) = base64::decode(data_str) {
-                                                    instruction_data.push(data);
-                                                } else {
-                                                    log::debug!("Failed to decode instruction data as base58 or base64");
+                                                match base64::decode(data_str) {
+                                                    Ok(data) => {
+                                                        instruction_data.push(data);
+                                                    },
+                                                    Err(err) => {
+                                                        log::debug!("Failed to decode base64 data: {}", err);
+                                                    }
                                                 }
                                             }
                                         }
@@ -102,21 +106,19 @@ pub fn extract_instruction_data(
                 // Process binary-encoded transaction
                 log::debug!("Processing binary transaction with encoding: {:?}", encoding);
                 
-                // For binary transactions, we would need to:
-                // 1. Decode the transaction based on the encoding
-                // 2. Parse the message
-                // 3. Extract instructions for our program
-                
-                // This is a simplified placeholder implementation
-                if let Ok(transaction_bytes) = base64::decode(data) {
-                    // In a real implementation, we would parse the transaction bytes
-                    // and extract instructions for our program
-                    
-                    // For now, just check if our program ID appears in the data
-                    let program_id_bytes = program_id.to_bytes();
-                    if transaction_bytes.windows(program_id_bytes.len()).any(|window| window == program_id_bytes) {
-                        // If we find the program ID, add a placeholder instruction
-                        instruction_data.push(vec![0, 1, 2, 3]);
+                match encoding {
+                    TransactionBinaryEncoding::Base58 => {
+                        if let Ok(tx_data) = bs58::decode(data).into_vec() {
+                            extract_from_binary(&tx_data, program_id, &mut instruction_data);
+                        }
+                    },
+                    TransactionBinaryEncoding::Base64 => {
+                        if let Ok(tx_data) = base64::decode(data) {
+                            extract_from_binary(&tx_data, program_id, &mut instruction_data);
+                        }
+                    },
+                    _ => {
+                        log::debug!("Unsupported binary encoding");
                     }
                 }
             },
@@ -127,14 +129,38 @@ pub fn extract_instruction_data(
         }
     }
     
-    // If we couldn't extract any real data, add some placeholders for testing
-    if instruction_data.is_empty() && !transactions.is_empty() {
-        log::debug!("No instruction data extracted, adding placeholders");
-        instruction_data.push(vec![0, 1, 2, 3]);
-        instruction_data.push(vec![1, 4, 5, 6]);
-    }
-    
     instruction_data
+}
+
+/// Extract instruction data from binary transaction data
+fn extract_from_binary(tx_data: &[u8], program_id: &Pubkey, instruction_data: &mut Vec<Vec<u8>>) {
+    // This is a simplified implementation
+    // In a real implementation, we would parse the transaction format
+    // and extract instructions for our program
+    
+    // Look for program ID in the transaction data
+    let program_id_bytes = program_id.to_bytes();
+    
+    // Scan for program ID followed by instruction data
+    // This is a heuristic approach and may not work for all transactions
+    for window in tx_data.windows(program_id_bytes.len()) {
+        if window == program_id_bytes.as_ref() {
+            // Found program ID, try to extract instruction data
+            // Typically, instruction data follows the program ID and account indices
+            // This is a simplified approach
+            let pos = window.as_ptr() as usize - tx_data.as_ptr() as usize;
+            if pos + program_id_bytes.len() + 1 < tx_data.len() {
+                // Extract a chunk of data after the program ID
+                // In a real implementation, we would parse the exact instruction data
+                let data_start = pos + program_id_bytes.len() + 1;
+                let data_end = std::cmp::min(data_start + 32, tx_data.len());
+                let data = tx_data[data_start..data_end].to_vec();
+                if !data.is_empty() {
+                    instruction_data.push(data);
+                }
+            }
+        }
+    }
 }
 
 /// Analyze instruction patterns
@@ -262,9 +288,9 @@ fn analyze_account_patterns(
         match transaction {
             solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
                 // Process JSON-encoded transaction
-                if let Some(message) = &ui_transaction.message {
+                if let Some(ui_message) = &ui_transaction.message {
                     // Extract instructions
-                    if let Some(instructions) = &message.instructions {
+                    if let Some(instructions) = &ui_message.instructions {
                         for instruction in instructions {
                             // Check if this instruction is for our program
                             if let Some(program_id_str) = &instruction.program_id {
@@ -277,16 +303,14 @@ fn analyze_account_patterns(
                                         for (i, account_idx_str) in accounts.iter().enumerate() {
                                             if let Ok(idx) = account_idx_str.parse::<usize>() {
                                                 // Check if the account is a signer or writable
-                                                let is_signer = is_account_signer(message, idx);
-                                                let is_writable = is_account_writable(message, idx);
+                                                let is_signer = is_account_signer(ui_message, idx);
+                                                let is_writable = is_account_writable(ui_message, idx);
                                                 
                                                 // Create a key for this pattern
                                                 let key = (discriminator, i, is_signer, is_writable);
                                                 
                                                 // Count frequency
                                                 *frequency_map.entry(key).or_insert(0) += 1;
-                                            } else {
-                                                log::debug!("Failed to parse account index: {}", account_idx_str);
                                             }
                                         }
                                     }
@@ -296,14 +320,9 @@ fn analyze_account_patterns(
                     }
                 }
             },
-            solana_transaction_status::EncodedTransaction::Binary(_, _) => {
-                // Process binary-encoded transaction
-                // This would require more complex decoding
-                log::debug!("Binary transaction analysis not implemented");
-            },
             _ => {
-                // Handle other encoding formats
-                log::debug!("Unsupported transaction encoding format");
+                // Binary transactions are handled in extract_instruction_data
+                // We focus on JSON transactions for account patterns
             }
         }
     }
@@ -319,117 +338,186 @@ fn analyze_account_patterns(
         });
     }
     
-    // If we couldn't extract any patterns, add a placeholder
-    if patterns.is_empty() && !transactions.is_empty() {
-        log::debug!("No account patterns extracted, adding placeholder");
-        patterns.push(AccountPattern {
-            instruction_index: 0,
-            account_index: 0,
-            is_signer: true,
-            is_writable: true,
-            frequency: 1,
-        });
-    }
+    // Sort by frequency (most common first)
+    patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
     
     patterns
 }
 
 /// Extract the instruction discriminator
-fn extract_discriminator(instruction: &solana_transaction_status::UiInstruction) -> u8 {
-    // The UiInstruction structure has a data field that contains the base58-encoded instruction data
+pub fn extract_discriminator(instruction: &UiInstruction) -> u8 {
+    // The UiInstruction doesn't have a direct data field, it has a data Option<String>
     if let Some(data_str) = &instruction.data {
         // Try to decode the data
-        match bs58::decode(data_str).into_vec() {
-            Ok(data) => {
-                if !data.is_empty() {
-                    return data[0];
-                }
-            },
-            Err(err) => {
-                log::debug!("Failed to decode instruction data: {}", err);
+        if let Ok(data) = bs58::decode(data_str).into_vec() {
+            if !data.is_empty() {
+                return data[0];
             }
         }
     }
-    0 // Default discriminator if we can't extract one
+    0
 }
 
 /// Check if an account is a signer
-fn is_account_signer(message: &solana_transaction_status::UiMessage, account_idx: usize) -> bool {
-    // The UiMessage structure has changed - we need to adapt our code
-    // Check if the account is in the signers list
-    if let Some(signers) = &message.header.as_ref().map(|h| &h.num_required_signatures) {
-        if let Ok(num_signers) = signers.parse::<usize>() {
-            return account_idx < num_signers;
-        }
-    }
-    
-    // Alternative approach: check if the account is marked as a signer in the account keys
+pub fn is_account_signer(message: &UiMessage, account_idx: usize) -> bool {
+    // The UiMessage structure is different than expected
+    // Let's use a simpler approach based on the account_keys
     if let Some(account_keys) = &message.account_keys {
         if account_idx < account_keys.len() {
-            if let Some(meta) = account_keys.get(account_idx) {
-                return meta.signer;
-            }
+            return account_keys[account_idx].signer;
         }
     }
-    
     false
 }
 
 /// Check if an account is writable
-fn is_account_writable(message: &solana_transaction_status::UiMessage, account_idx: usize) -> bool {
-    // The UiMessage structure has changed - we need to adapt our code
-    // First approach: use header information
-    if let Some(header) = &message.header {
-        // Calculate writable accounts based on header information
-        if let (Some(num_signers_str), Some(num_readonly_signers_str)) = (
-            &header.num_required_signatures,
-            &header.num_readonly_signed_accounts
-        ) {
-            if let (Ok(num_signers), Ok(num_readonly_signers)) = (
-                num_signers_str.parse::<usize>(),
-                num_readonly_signers_str.parse::<usize>()
-            ) {
-                // If it's a signer, check if it's not in the readonly signers
-                if account_idx < num_signers {
-                    return account_idx < (num_signers - num_readonly_signers);
-                }
-                
-                // If it's not a signer, check if it's not in the readonly non-signers
-                if let Some(num_readonly_unsigned_str) = &header.num_readonly_unsigned_accounts {
-                    if let Ok(num_readonly_unsigned) = num_readonly_unsigned_str.parse::<usize>() {
-                        if let Some(account_keys) = &message.account_keys {
-                            let num_accounts = account_keys.len();
-                            let num_unsigned = num_accounts - num_signers;
-                            
-                            if account_idx >= num_signers {
-                                return (account_idx - num_signers) < (num_unsigned - num_readonly_unsigned);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Alternative approach: check if the account is marked as writable in the account keys
+pub fn is_account_writable(message: &UiMessage, account_idx: usize) -> bool {
+    // The UiMessage structure is different than expected
+    // Let's use a simpler approach based on the account_keys
     if let Some(account_keys) = &message.account_keys {
         if account_idx < account_keys.len() {
-            if let Some(meta) = account_keys.get(account_idx) {
-                return meta.writable;
-            }
+            return account_keys[account_idx].writable;
         }
     }
-    
     false
 }
 
 /// Detect common parameter patterns in instruction data
 pub fn detect_parameter_patterns(instruction_data: &[Vec<u8>]) -> Vec<String> {
-    // Placeholder implementation
-    // this would analyze instruction data
-    // to identify common parameter patterns
+    let mut parameter_types = Vec::new();
     
-    Vec::new()
+    // Group instruction data by first byte (discriminator)
+    let mut grouped_data = std::collections::HashMap::new();
+    
+    for data in instruction_data {
+        if !data.is_empty() {
+            let discriminator = data[0];
+            grouped_data.entry(discriminator)
+                .or_insert_with(Vec::new)
+                .push(data.clone());
+        }
+    }
+    
+    // Analyze each group to detect parameter patterns
+    for (discriminator, data_group) in grouped_data {
+        // Skip if we don't have enough samples
+        if data_group.len() < 2 {
+            continue;
+        }
+        
+        // Find the most common data length for this discriminator
+        let mut length_counts = std::collections::HashMap::new();
+        for data in &data_group {
+            *length_counts.entry(data.len()).or_insert(0) += 1;
+        }
+        
+        let most_common_length = length_counts.iter()
+            .max_by_key(|&(_, count)| *count)
+            .map(|(&length, _)| length)
+            .unwrap_or(0);
+        
+        // Filter data to only include the most common length
+        let filtered_data: Vec<_> = data_group.iter()
+            .filter(|data| data.len() == most_common_length)
+            .collect();
+        
+        if filtered_data.is_empty() {
+            continue;
+        }
+        
+        // Analyze parameter types based on the filtered data
+        // Skip the first byte (discriminator)
+        if most_common_length > 1 {
+            let param_data: Vec<_> = filtered_data.iter()
+                .map(|data| &data[1..])
+                .collect();
+            
+            // Infer parameter types
+            let types = infer_parameter_types_from_samples(&param_data);
+            parameter_types.extend(types);
+        }
+    }
+    
+    parameter_types
+}
+
+/// Infer parameter types from multiple samples
+pub fn infer_parameter_types_from_samples(samples: &[&[u8]]) -> Vec<String> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    
+    let first_sample = samples[0];
+    let mut types = Vec::new();
+    let mut offset = 0;
+    
+    // Process the data in chunks
+    while offset < first_sample.len() {
+        // Check for consistent patterns across all samples
+        
+        // Check for Pubkey (32 bytes)
+        if offset + 32 <= first_sample.len() {
+            let is_pubkey = samples.iter().all(|sample| {
+                let slice = &sample[offset..offset + 32];
+                // Pubkeys are unlikely to be all zeros or all ones
+                let zeros = slice.iter().filter(|&&b| b == 0).count();
+                let ones = slice.iter().filter(|&&b| b == 1).count();
+                zeros < 30 && ones < 30
+            });
+            
+            if is_pubkey {
+                types.push("pubkey".to_string());
+                offset += 32;
+                continue;
+            }
+        }
+        
+        // Check for u64 (8 bytes)
+        if offset + 8 <= first_sample.len() {
+            let is_u64 = samples.iter().all(|sample| {
+                let slice = &sample[offset..offset + 8];
+                // Most u64 values have zeros in the high bytes
+                slice[4..].iter().any(|&b| b == 0)
+            });
+            
+            if is_u64 {
+                types.push("u64".to_string());
+                offset += 8;
+                continue;
+            }
+        }
+        
+        // Check for u32 (4 bytes)
+        if offset + 4 <= first_sample.len() {
+            types.push("u32".to_string());
+            offset += 4;
+            continue;
+        }
+        
+        // Check for u16 (2 bytes)
+        if offset + 2 <= first_sample.len() {
+            types.push("u16".to_string());
+            offset += 2;
+            continue;
+        }
+        
+        // Check for u8 (1 byte)
+        if offset + 1 <= first_sample.len() {
+            types.push("u8".to_string());
+            offset += 1;
+            continue;
+        }
+        
+        // If we get here, we couldn't determine the type
+        break;
+    }
+    
+    // If we have remaining data, add it as a bytes type
+    if offset < first_sample.len() {
+        types.push(format!("bytes[{}]", first_sample.len() - offset));
+    }
+    
+    types
 }
 
 /// Detect common account usage patterns
@@ -437,9 +525,138 @@ pub fn detect_account_patterns(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
 ) -> Vec<AccountPattern> {
-    // Placeholder implementation
-    // this would analyze account usage patterns
-    // in transactions to identify common patterns
+    let mut patterns = Vec::new();
+    let mut frequency_map = std::collections::HashMap::new();
     
-    Vec::new()
+    for transaction in transactions {
+        match transaction {
+            solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
+                // Process JSON-encoded transaction
+                if let Some(ui_message) = &ui_transaction.message {
+                    // Extract instructions
+                    if let Some(instructions) = &ui_message.instructions {
+                        for instruction in instructions {
+                            // Check if this instruction is for our program
+                            if let Some(program_id_str) = &instruction.program_id {
+                                if program_id_str == &program_id.to_string() {
+                                    // Extract instruction discriminator
+                                    let discriminator = extract_discriminator(instruction);
+                                    
+                                    // Extract account usage
+                                    if let Some(accounts) = &instruction.accounts {
+                                        for (i, account_idx_str) in accounts.iter().enumerate() {
+                                            if let Ok(idx) = account_idx_str.parse::<usize>() {
+                                                // Check if the account is a signer or writable
+                                                let is_signer = is_account_signer(ui_message, idx);
+                                                let is_writable = is_account_writable(ui_message, idx);
+                                                
+                                                // Create a key for this pattern
+                                                let key = (discriminator, i, is_signer, is_writable);
+                                                
+                                                // Count frequency
+                                                *frequency_map.entry(key).or_insert(0) += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {
+                // Binary transactions are handled in extract_instruction_data
+                // We focus on JSON transactions for account patterns
+            }
+        }
+    }
+    
+    // Convert frequency map to patterns
+    for ((discriminator, account_index, is_signer, is_writable), frequency) in frequency_map {
+        patterns.push(AccountPattern {
+            instruction_index: discriminator,
+            account_index,
+            is_signer,
+            is_writable,
+            frequency,
+        });
+    }
+    
+    // Sort by frequency (most common first)
+    patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+    
+    patterns
+}
+
+/// Try to identify the account type based on its usage pattern
+pub fn identify_account_type(
+    program_id: &Pubkey,
+    account_pubkey: &Pubkey,
+    is_signer: bool,
+    is_writable: bool,
+    transactions: &[solana_transaction_status::EncodedTransaction],
+) -> String {
+    // Common account types
+    if account_pubkey == program_id {
+        return "program".to_string();
+    }
+    
+    if account_pubkey == &solana_sdk::system_program::id() {
+        return "system_program".to_string();
+    }
+    
+    if account_pubkey == &solana_sdk::sysvar::rent::id() {
+        return "rent".to_string();
+    }
+    
+    if account_pubkey == &solana_sdk::sysvar::clock::id() {
+        return "clock".to_string();
+    }
+    
+    // Heuristics for other account types
+    if is_signer && is_writable {
+        return "authority".to_string();
+    }
+    
+    if is_signer && !is_writable {
+        return "signer".to_string();
+    }
+    
+    if !is_signer && is_writable {
+        return "data".to_string();
+    }
+    
+    "account".to_string()
+}
+
+/// Try to identify the instruction type based on its discriminator and parameters
+pub fn identify_instruction_type(
+    discriminator: u8,
+    param_types: &[String],
+    account_types: &[String],
+) -> String {
+    // Common instruction types based on discriminator
+    match discriminator {
+        0 => {
+            if account_types.contains(&"authority".to_string()) {
+                return "initialize".to_string();
+            }
+            return "create".to_string();
+        },
+        1 => return "transfer".to_string(),
+        2 => return "update".to_string(),
+        3 => return "close".to_string(),
+        _ => {}
+    }
+    
+    // Heuristics based on parameters and accounts
+    if param_types.contains(&"pubkey".to_string()) && param_types.contains(&"u64".to_string()) {
+        return "transfer".to_string();
+    }
+    
+    if account_types.contains(&"authority".to_string()) && account_types.contains(&"data".to_string()) {
+        return "update".to_string();
+    }
+    
+    format!("instruction_{}", discriminator)
 } 

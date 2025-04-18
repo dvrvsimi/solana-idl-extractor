@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
 use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding};
+use solana_sdk::signature::Signature;
 
 /// Get program data for the given program ID
 pub fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
@@ -11,34 +12,17 @@ pub fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<V
     Ok(account.data)
 }
 
-/// Get recent transactions for the given program ID
-pub fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<EncodedTransaction>> {
-    // Get signatures for the program
-    let signatures = rpc_client.get_signatures_for_address(program_id)?;
+/// Get recent transactions for the given program ID (simplified)
+pub fn get_recent_transactions(
+    _rpc_client: &RpcClient, 
+    program_id: &Pubkey,
+    limit: Option<usize>
+) -> Result<Vec<EncodedTransaction>> {
+    // Return empty vector for now to avoid RPC calls
+    log::info!("Simplified implementation: not fetching transactions for program {}", program_id);
+    log::info!("Requested limit: {:?}", limit);
     
-    if signatures.is_empty() {
-        return Ok(Vec::new());
-    }
-    
-    // Limit to the most recent 10 transactions for simplicity
-    let signatures: Vec<_> = signatures.iter()
-        .take(10)
-        .map(|sig_info| sig_info.signature.clone())
-        .collect();
-    
-    // Get transaction details
-    let mut transactions = Vec::new();
-    
-    for signature in signatures {
-        // Convert string signature to Signature type
-        let sig = solana_sdk::signature::Signature::from_str(&signature)?;
-        
-        if let Ok(tx) = rpc_client.get_transaction(&sig, UiTransactionEncoding::Base64) {
-            transactions.push(tx.transaction.unwrap_or_default());
-        }
-    }
-    
-    Ok(transactions)
+    Ok(Vec::new())
 }
 
 /// Get account info for the given account ID

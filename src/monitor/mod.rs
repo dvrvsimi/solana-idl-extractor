@@ -1,7 +1,7 @@
 //! Transaction monitoring for Solana programs
 
 mod rpc;
-mod transaction;
+pub mod transaction;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
@@ -32,7 +32,7 @@ impl Monitor {
     
     /// Get recent transactions for the given program ID
     pub async fn get_recent_transactions(&self, program_id: &Pubkey) -> Result<Vec<EncodedTransaction>> {
-        rpc::get_recent_transactions(&self.rpc_client, program_id)
+        rpc::get_recent_transactions(&self.rpc_client, program_id, None)
     }
     
     /// Analyze transactions for the given program ID
