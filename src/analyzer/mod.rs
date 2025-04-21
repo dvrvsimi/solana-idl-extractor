@@ -1,16 +1,18 @@
 //! Analyzer module for Solana programs
 
-mod bytecode;
+pub mod bytecode;
 // pub mod patterns;  // Comment out the original patterns module
 pub mod patterns_simplified;  // Import the simplified module
 pub use patterns_simplified as patterns;  // Re-export it as patterns
 #[cfg(test)]
 mod tests;
+pub mod anchor;
+pub mod known_programs;  // Add this line to create the module
 
 use anyhow::Result;
 use solana_sdk::pubkey::Pubkey;
 use solana_client::rpc_client::RpcClient;
-use log::info;
+use log::{info, warn};
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
@@ -80,25 +82,104 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
     // Get program data
     let program_data = get_program_data(rpc_client, program_id)?;
     
-    // Analyze bytecode
-    let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())?;
-    
-    // Create IDL
-    let mut idl = IDL::new(format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), program_id.to_string());
-    
-    // Add instructions
-    for instruction in bytecode_analysis.instructions {
-        idl.add_instruction(instruction);
+    // Check for known program IDs first
+    if program_id.to_string() == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
+        info!("Detected Token program, using specialized analysis");
+        return known_programs::analyze_token_program(program_id);
     }
     
-    // Add accounts
-    for account in bytecode_analysis.accounts {
-        idl.add_account(account);
-    }
+    // Check if this is an Anchor program
+    let is_anchor = anchor::is_anchor_program(&program_data);
     
-    // Add metadata
-    idl.metadata.address = program_id.to_string();
-    idl.metadata.origin = "native".to_string();
+    let mut idl = if is_anchor {
+        info!("Detected Anchor program, using specialized analysis");
+        match anchor::analyze(program_id, &program_data) {
+            Ok(analysis) => {
+                let mut idl = IDL::new(
+                    format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+                    program_id.to_string()
+                );
+                
+                // Add instructions
+                for instruction in analysis.instructions {
+                    idl.add_instruction(instruction);
+                }
+                
+                // Add accounts
+                for account in analysis.accounts {
+                    idl.add_account(account);
+                }
+                
+                // Add error codes
+                for (code, name) in analysis.error_codes {
+                    idl.add_error(code, name.clone(), name);
+                }
+                
+                // Set metadata
+                idl.metadata.address = program_id.to_string();
+                idl.metadata.origin = "anchor".to_string();
+                
+                idl
+            },
+            Err(e) => {
+                warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
+                // Fall back to bytecode analysis
+                let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())?;
+                
+                let mut idl = IDL::new(
+                    format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+                    program_id.to_string()
+                );
+                
+                // Add instructions
+                for instruction in bytecode_analysis.instructions {
+                    idl.add_instruction(instruction);
+                }
+                
+                // Add accounts
+                for account in bytecode_analysis.accounts {
+                    idl.add_account(account);
+                }
+                
+                // Set metadata
+                idl.metadata.address = program_id.to_string();
+                idl.metadata.origin = "native".to_string();
+                
+                idl
+            }
+        }
+    } else {
+        // Analyze bytecode
+        let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())?;
+        
+        let mut idl = IDL::new(
+            format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+            program_id.to_string()
+        );
+        
+        // Add instructions
+        for instruction in bytecode_analysis.instructions {
+            idl.add_instruction(instruction);
+        }
+        
+        // Add accounts
+        for account in bytecode_analysis.accounts {
+            idl.add_account(account);
+        }
+        
+        // Set metadata
+        idl.metadata.address = program_id.to_string();
+        idl.metadata.origin = "native".to_string();
+        
+        idl
+    };
+    
+    // Enhance IDL with Anchor-specific information if applicable
+    if is_anchor {
+        if let Err(e) = anchor::enhance_idl(&mut idl, &program_data) {
+            warn!("Failed to enhance IDL with Anchor information: {}", e);
+        }
+    }
     
     Ok(idl)
 }

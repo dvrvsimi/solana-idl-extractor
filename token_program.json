@@ -1,5 +1,5 @@
 {
-  "name": "program_TokenkegQf",
+  "name": "TokenProgram",
   "version": "0.1.0",
   "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
   "instructions": [
@@ -33,7 +33,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "initializeAccount",
@@ -64,7 +65,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "transfer",
@@ -94,7 +96,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "approve",
@@ -124,7 +127,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "revoke",
@@ -143,7 +147,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "setAuthority",
@@ -171,7 +176,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "mintTo",
@@ -201,7 +207,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "burn",
@@ -231,7 +238,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     },
     {
       "name": "closeAccount",
@@ -256,7 +264,8 @@
           "is_writable": false,
           "is_optional": false
         }
-      ]
+      ],
+      "discriminator": null
     }
   ],
   "accounts": [
@@ -331,13 +340,9 @@
   "errors": [],
   "metadata": {
     "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "origin": "native",
+    "origin": "spl-token",
     "framework_version": null,
-    "instruction_frequencies": [
-      [
-        0,
-        10
-      ]
-    ]
+    "instruction_frequencies": null,
+    "notes": null
   }
 }

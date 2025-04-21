@@ -22,16 +22,9 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
         return analyze_token_program(program_data);
     }
     
-    // Special handling for known programs
-    if is_token_program(program_data) {
-        info!("Detected Token program, using specialized analysis");
-        return analyze_token_program(program_data);
-    } else {
-        info!("Not detected as Token program");
-    }
-    
     if program_data.len() < 8 {
-        return Err(anyhow!("Program data too small to be a valid Solana program (size: {} bytes)", program_data.len()));
+        info!("Program data too small to be a valid Solana program (size: {} bytes)", program_data.len());
+        return create_minimal_idl();
     }
     
     // Check if this is an ELF file
@@ -40,7 +33,7 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
        program_data[1] == b'E' && 
        program_data[2] == b'L' && 
        program_data[3] == b'F' {
-        debug!("Valid ELF file detected");
+        info!("Valid ELF file detected");
     } else {
         // Print the first few bytes for debugging
         let prefix = if program_data.len() >= 16 {

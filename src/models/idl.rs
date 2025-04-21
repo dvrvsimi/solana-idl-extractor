@@ -47,6 +47,8 @@ pub struct Metadata {
     pub framework_version: Option<String>,
     /// Instruction frequencies from transaction analysis
     pub instruction_frequencies: Option<Vec<(u8, u64)>>,
+    /// Additional notes about the IDL
+    pub notes: Option<String>,
 }
 
 impl IDL {
@@ -64,6 +66,7 @@ impl IDL {
                 origin: "".to_string(),
                 framework_version: None,
                 instruction_frequencies: None,
+                notes: None,
             },
         }
     }
@@ -158,5 +161,18 @@ impl IDL {
             .collect();
         
         self.metadata.instruction_frequencies = Some(frequencies);
+    }
+}
+
+impl Metadata {
+    /// Create new metadata
+    pub fn new(address: String, origin: String) -> Self {
+        Self {
+            address,
+            origin,
+            framework_version: None,
+            instruction_frequencies: None,
+            notes: None,
+        }
     }
 } 

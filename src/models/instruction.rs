@@ -13,6 +13,8 @@ pub struct Instruction {
     pub args: Vec<InstructionArg>,
     /// Instruction accounts
     pub accounts: Vec<InstructionAccount>,
+    /// Instruction discriminator (for Anchor programs)
+    pub discriminator: Option<[u8; 8]>,
 }
 
 /// Represents an instruction argument
@@ -45,6 +47,7 @@ impl Instruction {
             index,
             args: Vec::new(),
             accounts: Vec::new(),
+            discriminator: None,
         }
     }
     
