@@ -82,12 +82,6 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
     // Get program data
     let program_data = get_program_data(rpc_client, program_id)?;
     
-    // Check for known program IDs first
-    if program_id.to_string() == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
-        info!("Detected Token program, using specialized analysis");
-        return known_programs::analyze_token_program(program_id);
-    }
-    
     // Check if this is an Anchor program
     let is_anchor = anchor::is_anchor_program(&program_data);
     

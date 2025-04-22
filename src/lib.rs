@@ -156,12 +156,6 @@ fn create_minimal_idl(program_id: &Pubkey, reason: &str) -> models::idl::IDL {
 fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
     info!("Analyzing program: {}", program_id);
     
-    // Check for known program IDs first
-    if program_id.to_string() == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
-        info!("Detected Token program, using specialized analysis");
-        return analyzer::known_programs::analyze_token_program(program_id);
-    }
-    
     // Analyze bytecode
     let bytecode_analysis = analyzer::bytecode::analyze(program_data, &program_id.to_string())
         .with_context(|| "Failed to analyze program bytecode")?;

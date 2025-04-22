@@ -1,30 +1,233 @@
 //! Bytecode parsing and analysis for Solana programs
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
+use log::{debug, info, warn};
+use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
+use solana_sdk::pubkey::Pubkey;
+use solana_sdk::hash::{hash, Hash};
+use goblin::elf::{Elf, SectionHeader};
+
 use crate::models::{instruction::Instruction, account::Account};
-use log::{debug, info};
+
+/// SBF Instruction opcodes
+mod opcodes {
+    // Jump instructions
+    pub const JA: u8 = 0x05;
+    pub const JEQ_REG: u8 = 0x15;
+    pub const JEQ_IMM: u8 = 0x1d;
+    pub const JNE_REG: u8 = 0x55;
+    pub const JNE_IMM: u8 = 0x5d;
+    
+    // Call instructions
+    pub const CALL: u8 = 0x85;
+    pub const EXIT: u8 = 0x95;
+    
+    // Load instructions
+    pub const LDDW: u8 = 0x18;
+    pub const LDXB: u8 = 0x71;
+    pub const LDXH: u8 = 0x69;
+    pub const LDXW: u8 = 0x61;
+    pub const LDXDW: u8 = 0x79;
+    
+    // Store instructions
+    pub const STB: u8 = 0x72;
+    pub const STH: u8 = 0x6a;
+    pub const STW: u8 = 0x62;
+    pub const STDW: u8 = 0x7a;
+    pub const STXB: u8 = 0x73;
+    pub const STXH: u8 = 0x6b;
+    pub const STXW: u8 = 0x63;
+    pub const STXDW: u8 = 0x7b;
+    
+    // ALU instructions
+    pub const MOV_IMM: u8 = 0xb7;
+    pub const MOV_REG: u8 = 0xbf;
+}
+
+/// Common Sealevel syscall hashes
+mod syscalls {
+    pub const SOL_LOG: u32 = 0x207559bd;
+    pub const SOL_LOG_PUBKEY: u32 = 0x7ef088ca;
+    pub const SOL_CREATE_PROGRAM_ADDRESS: u32 = 0x9377323c;
+    pub const SOL_TRY_FIND_PROGRAM_ADDRESS: u32 = 0x48504a38;
+    pub const SOL_INVOKE_SIGNED_C: u32 = 0xa22b9c85;
+    pub const SOL_INVOKE_SIGNED_RUST: u32 = 0xd7449092;
+    pub const SOL_PANIC: u32 = 0x686093bb;
+}
+
+/// SBF instruction format
+#[derive(Debug, Clone)]
+struct SbfInstruction {
+    /// Opcode
+    opcode: u8,
+    /// Destination register
+    dst_reg: u8,
+    /// Source register
+    src_reg: u8,
+    /// Offset
+    offset: i16,
+    /// Immediate value
+    imm: i32,
+    /// Address in the binary
+    address: usize,
+}
+
+impl SbfInstruction {
+    /// Parse an SBF instruction from a byte slice
+    fn parse(data: &[u8], address: usize) -> Result<Self> {
+        if data.len() < 8 {
+            return Err(anyhow!("Instruction data too short"));
+        }
+        
+        let opcode = data[0];
+        let dst_reg = (data[1] & 0xf0) >> 4;
+        let src_reg = data[1] & 0x0f;
+        let offset = i16::from_le_bytes([data[2], data[3]]);
+        let imm = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        
+        Ok(Self {
+            opcode,
+            dst_reg,
+            src_reg,
+            offset,
+            imm,
+            address,
+        })
+    }
+    
+    /// Check if this is a jump instruction
+    fn is_jump(&self) -> bool {
+        matches!(
+            self.opcode,
+            opcodes::JA | opcodes::JEQ_REG | opcodes::JEQ_IMM | 
+            opcodes::JNE_REG | opcodes::JNE_IMM
+        )
+    }
+    
+    /// Check if this is a call instruction
+    fn is_call(&self) -> bool {
+        self.opcode == opcodes::CALL
+    }
+    
+    /// Check if this is an exit instruction
+    fn is_exit(&self) -> bool {
+        self.opcode == opcodes::EXIT
+    }
+    
+    /// Check if this is a load instruction
+    fn is_load(&self) -> bool {
+        matches!(
+            self.opcode,
+            opcodes::LDXB | opcodes::LDXH | opcodes::LDXW | opcodes::LDXDW
+        )
+    }
+    
+    /// Check if this is a store instruction
+    fn is_store(&self) -> bool {
+        matches!(
+            self.opcode,
+            opcodes::STB | opcodes::STH | opcodes::STW | opcodes::STDW |
+            opcodes::STXB | opcodes::STXH | opcodes::STXW | opcodes::STXDW
+        )
+    }
+    
+    /// Get the size of the load/store operation
+    fn mem_size(&self) -> Option<usize> {
+        match self.opcode {
+            opcodes::LDXB | opcodes::STB | opcodes::STXB => Some(1),
+            opcodes::LDXH | opcodes::STH | opcodes::STXH => Some(2),
+            opcodes::LDXW | opcodes::STW | opcodes::STXW => Some(4),
+            opcodes::LDXDW | opcodes::STDW | opcodes::STXDW => Some(8),
+            _ => None,
+        }
+    }
+}
+
+/// ELF section
+#[derive(Debug, Clone)]
+struct ElfSection {
+    /// Section name
+    name: String,
+    /// Section data
+    data: Vec<u8>,
+    /// Section address
+    address: usize,
+    /// Section size
+    size: usize,
+}
+
+/// Basic block in the control flow graph
+#[derive(Debug, Clone)]
+struct BasicBlock {
+    /// Start address
+    start: usize,
+    /// End address
+    end: usize,
+    /// Instructions in this block
+    instructions: Vec<SbfInstruction>,
+    /// Successor blocks
+    successors: Vec<usize>,
+    /// Predecessor blocks
+    predecessors: Vec<usize>,
+}
+
+/// Function in the program
+#[derive(Debug, Clone)]
+struct Function {
+    /// Function name
+    name: String,
+    /// Entry point address
+    entry: usize,
+    /// Exit points
+    exits: Vec<usize>,
+    /// Basic blocks in this function
+    blocks: Vec<usize>,
+}
+
+/// Instruction handler
+#[derive(Debug, Clone)]
+struct InstructionHandler {
+    /// Handler name
+    name: String,
+    /// Entry point address
+    entry: usize,
+    /// Discriminator
+    discriminator: Option<u8>,
+    /// Anchor discriminator (8 bytes)
+    anchor_discriminator: Option<[u8; 8]>,
+    /// Parameter types
+    parameters: Vec<String>,
+    /// Required accounts
+    accounts: Vec<(String, bool, bool)>, // (name, is_signer, is_writable)
+}
 
 /// Results of bytecode analysis
+#[derive(Debug)]
 pub struct BytecodeAnalysis {
     /// Extracted instructions
     pub instructions: Vec<Instruction>,
     /// Extracted account structures
     pub accounts: Vec<Account>,
+    /// Is this an Anchor program?
+    pub is_anchor: bool,
+    /// Error codes
+    pub error_codes: HashMap<u32, String>,
 }
 
 /// Analyze program bytecode to extract instruction and account information
-pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis> {
-    info!("Analyzing program bytecode of size: {} bytes", program_data.len());
-    
-    // Special handling for known programs by ID
-    if program_id == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
-        info!("Detected Token program by ID, using specialized analysis");
-        return analyze_token_program(program_data);
-    }
+pub fn analyze(program_data: &[u8]) -> Result<BytecodeAnalysis> {
+    // For backward compatibility with tests
+    analyze_with_id(program_data, "unknown")
+}
+
+/// Analyze program bytecode with program ID
+pub fn analyze_with_id(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis> {
+    info!("Analyzing program bytecode, size: {} bytes", program_data.len());
     
     if program_data.len() < 8 {
         info!("Program data too small to be a valid Solana program (size: {} bytes)", program_data.len());
-        return create_minimal_idl();
+        return create_minimal_analysis();
     }
     
     // Check if this is an ELF file
@@ -49,422 +252,154 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
         
         info!("Not a valid ELF file. First bytes: {}", prefix_hex);
         
-        // Try to create a minimal IDL anyway
-        return create_minimal_idl();
+        // Try to create a minimal analysis anyway
+        return create_minimal_analysis();
     }
-    
-    // Check if this is an Anchor program
-    let is_anchor = is_anchor_program(program_data);
-    if is_anchor {
-        info!("Detected Anchor program, using Anchor-specific analysis");
-        return analyze_anchor_program(program_data);
-    }
-    
-    // For non-Anchor programs, use our improved instruction detection
-    let instructions = extract_detailed_instructions(program_data)?;
-    let accounts = extract_accounts(program_data)?;
-    
-    // Deduplicate accounts
-    let accounts = deduplicate_accounts(accounts);
-    
-    Ok(BytecodeAnalysis {
-        instructions,
-        accounts,
-    })
-}
-
-/// Analyze an Anchor program
-fn analyze_anchor_program(_program_data: &[u8]) -> Result<BytecodeAnalysis> {
-    let mut instructions = Vec::new();
-    
-    // Basic Anchor instruction detection
-    let mut init_instruction = Instruction::new("initialize".to_string(), 0);
-    init_instruction.add_arg("data".to_string(), "u64".to_string());
-    init_instruction.add_account("authority".to_string(), true, true, false);
-    init_instruction.add_account("system_program".to_string(), false, false, false);
-    
-    instructions.push(init_instruction);
-    
-    let mut accounts = Vec::new();
-    let mut state_account = Account::new("State".to_string(), "state".to_string());
-    state_account.add_field("authority".to_string(), "pubkey".to_string(), 8);
-    state_account.add_field("data".to_string(), "u64".to_string(), 40);
-    
-    accounts.push(state_account);
-    
-    Ok(BytecodeAnalysis {
-        instructions,
-        accounts,
-    })
-}
-
-/// Extract instruction definitions from program bytecode
-fn extract_instructions(program_data: &[u8]) -> Result<Vec<Instruction>> {
-    let mut instructions = Vec::new();
     
     // Parse ELF sections
-    let sections = parse_elf_sections(program_data)?;
+    let sections = parse_elf_sections(program_data)
+        .context("Failed to parse ELF sections")?;
     
-    // Look for instruction dispatch table
-    // In Solana programs, this is often a switch statement or jump table
-    // based on the first byte of instruction data
-    for (section_name, section_data) in &sections {
-        if section_name == ".text" {
-            // Look for common instruction dispatch patterns
-            // 1. Look for byte comparisons (in instruction handlers)
-            let dispatch_points = find_byte_comparisons(&section_data);
-            
-            for (offset, byte_value) in dispatch_points {
-                // Each comparison likely represents an instruction discriminator
-                let mut instruction = Instruction::new(
-                    format!("instruction_{}", byte_value),
-                    byte_value
-                );
-                
-                // Try to infer parameters by looking at memory access patterns
-                // after the discriminator check
-                let param_types = infer_parameters(&section_data, offset);
-                for (i, param_type) in param_types.iter().enumerate() {
-                    instruction.add_arg(format!("param{}", i), param_type.clone());
-                }
-                
-                // Try to infer required accounts
-                let accounts = infer_accounts(&section_data, offset);
-                for (i, (is_signer, is_writable)) in accounts.iter().enumerate() {
-                    instruction.add_account(
-                        format!("account{}", i),
-                        *is_signer,
-                        *is_writable,
-                        false
-                    );
-                }
-                
-                instructions.push(instruction);
-            }
-        }
-    }
+    // Find .text section for code analysis
+    let text_section = sections.iter()
+        .find(|s| s.name == ".text")
+        .ok_or_else(|| anyhow!("No .text section found"))?;
     
-    // If we couldn't find any instructions, add a placeholder
-    if instructions.is_empty() {
-        let mut instruction = Instruction::new("unknown".to_string(), 0);
-        instruction.add_arg("data".to_string(), "bytes".to_string());
-        instructions.push(instruction);
-    }
+    // Find .rodata section for string analysis
+    let rodata_section = sections.iter()
+        .find(|s| s.name == ".rodata")
+        .or_else(|| sections.iter().find(|s| s.name == ".data"));
     
-    Ok(instructions)
-}
-
-/// Find byte comparison operations in the code
-/// These are often used to check instruction discriminators
-fn find_byte_comparisons(code: &[u8]) -> Vec<(usize, u8)> {
-    let mut comparisons = Vec::new();
+    // Find .symtab section for symbol analysis
+    let symtab_section = sections.iter()
+        .find(|s| s.name == ".symtab");
     
-    // Common instruction dispatch patterns in Solana programs:
-    // 1. Comparison of the first byte with a constant
-    // 2. Switch statement on the first byte
-    // 3. Jump table based on the first byte
+    // Parse instructions from .text section
+    let instructions = parse_instructions(&text_section.data, text_section.address)
+        .context("Failed to parse instructions")?;
     
-    // Look for common x86_64 comparison patterns
-    // CMP instruction: 0x80 0x3F (compare byte at address)
-    // CMP instruction: 0x3C (compare AL with immediate)
-    for i in 0..code.len().saturating_sub(2) {
-        // Pattern: CMP byte ptr [reg], imm8
-        if code[i] == 0x80 && (code[i+1] & 0xF8) == 0x38 {
-            if i + 3 < code.len() {
-                let value = code[i+3];
-                comparisons.push((i, value));
-            }
-        }
-        // Pattern: CMP AL, imm8
-        else if code[i] == 0x3C {
-            if i + 1 < code.len() {
-                let value = code[i+1];
-                comparisons.push((i, value));
-            }
-        }
-        // Pattern: CMP reg, imm8 (0x83 0xF8-0xFF)
-        else if code[i] == 0x83 && (code[i+1] & 0xF8) == 0xF8 {
-            if i + 2 < code.len() {
-                let value = code[i+2];
-                comparisons.push((i, value));
-            }
-        }
-    }
+    // Build control flow graph
+    let (blocks, functions) = build_control_flow_graph(&instructions)
+        .context("Failed to build control flow graph")?;
     
-    // Filter out likely false positives
-    // 1. Keep only values in the range 0-10 (common instruction indices)
-    // 2. Remove duplicates
-    let mut filtered = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    // Extract strings from .rodata section
+    let strings = if let Some(rodata) = rodata_section {
+        extract_strings(&rodata.data)
+    } else {
+        Vec::new()
+    };
     
-    for (offset, value) in comparisons {
-        if value <= 10 && !seen.contains(&value) {
-            filtered.push((offset, value));
-            seen.insert(value);
-        }
-    }
+    // Check if this is an Anchor program
+    let is_anchor = detect_anchor_program(&instructions, &strings);
     
-    filtered
-}
-
-/// Infer parameter types from code after a discriminator check
-fn infer_parameters(code: &[u8], offset: usize) -> Vec<String> {
-    let mut params = Vec::new();
+    // Find instruction handlers
+    let handlers = if is_anchor {
+        find_anchor_instruction_handlers(&instructions, &blocks, &strings)
+    } else {
+        find_instruction_handlers(&instructions, &blocks, &functions, &strings)
+    };
     
-    // Look for memory access patterns after the comparison
-    // Common patterns include:
-    // 1. Loading data from instruction data buffer
-    // 2. Deserializing different types
+    // Extract error codes
+    let error_codes = extract_error_codes(&instructions, &strings);
     
-    // Scan the next 100 bytes after the comparison
-    let scan_end = std::cmp::min(offset + 100, code.len());
-    let scan_region = &code[offset..scan_end];
+    // Convert to IDL instructions
+    let idl_instructions = convert_to_idl_instructions(&handlers, is_anchor);
     
-    // Look for common size-based access patterns
-    // 8-byte access: likely u64/i64
-    // 4-byte access: likely u32/i32
-    // 32-byte access: likely Pubkey
+    // Extract account structures
+    let accounts = extract_account_structures(&instructions, &strings, is_anchor);
     
-    // Count memory access sizes
-    let mut size_8_count = 0;
-    let mut size_4_count = 0;
-    let mut size_32_count = 0;
-    
-    for i in 0..scan_region.len().saturating_sub(3) {
-        // MOV instructions with different sizes
-        if scan_region[i] == 0x8B { // MOV r32, r/m32
-            size_4_count += 1;
-        } else if scan_region[i] == 0x48 && scan_region[i+1] == 0x8B { // MOV r64, r/m64
-            size_8_count += 1;
-        }
-        
-        // Check for 32-byte access (common for Pubkey)
-        if i + 5 < scan_region.len() && 
-           scan_region[i] == 0xC7 && // MOV
-           scan_region[i+3] == 0x20 { // Size 32
-            size_32_count += 1;
-        }
-    }
-    
-    // Infer parameter types based on access patterns
-    if size_32_count > 0 {
-        params.push("pubkey".to_string());
-    }
-    
-    if size_8_count > size_4_count {
-        params.push("u64".to_string());
-    } else if size_4_count > 0 {
-        params.push("u32".to_string());
-    }
-    
-    // If we couldn't infer any parameters, add a default
-    if params.is_empty() {
-        params.push("bytes".to_string());
-    }
-    
-    params
-}
-
-/// Infer required accounts from code after a discriminator check
-fn infer_accounts(code: &[u8], offset: usize) -> Vec<(bool, bool)> {
-    let mut accounts = Vec::new();
-    
-    // Look for account validation patterns
-    // Common patterns include:
-    // 1. Checking if an account is a signer
-    // 2. Checking account ownership
-    // 3. Loading account data
-    
-    // Scan the next 200 bytes after the comparison
-    let scan_end = std::cmp::min(offset + 200, code.len());
-    let scan_region = &code[offset..scan_end];
-    
-    // Look for common account validation patterns
-    let mut signer_check_count = 0;
-    let mut write_access_count = 0;
-    let mut account_access_count = 0;
-    
-    for i in 0..scan_region.len().saturating_sub(10) {
-        // Look for "is_signer" checks
-        // This is often a bit test instruction
-        if scan_region[i] == 0xF6 && scan_region[i+1] == 0x40 {
-            signer_check_count += 1;
-        }
-        
-        // Look for account data access
-        // Often involves loading from an account data pointer
-        if scan_region[i] == 0x48 && scan_region[i+1] == 0x8B && 
-           scan_region[i+2] == 0x10 { // MOV rdx, [rax]
-            account_access_count += 1;
-        }
-        
-        // Look for write operations
-        // Often involves storing to an account data pointer
-        if scan_region[i] == 0x48 && scan_region[i+1] == 0x89 {
-            write_access_count += 1;
-        }
-    }
-    
-    // Infer account requirements based on patterns
-    if account_access_count > 0 {
-        // First account: often a signer and writable
-        accounts.push((signer_check_count > 0, write_access_count > 0));
-        
-        // Second account: often not a signer but writable
-        if account_access_count > 1 {
-            accounts.push((false, write_access_count > 1));
-        }
-        
-        // Third account: often system program or other program
-        if account_access_count > 2 {
-            accounts.push((false, false));
-        }
-    }
-    
-    // If we couldn't infer any accounts, add defaults
-    if accounts.is_empty() {
-        accounts.push((true, true));   // First account: signer and writable
-        accounts.push((false, true));  // Second account: not signer but writable
-        accounts.push((false, false)); // Third account: not signer, not writable
-    }
-    
-    accounts
+    Ok(BytecodeAnalysis {
+        instructions: idl_instructions,
+        accounts,
+        is_anchor,
+        error_codes,
+    })
 }
 
 /// Parse ELF sections from program data
-fn parse_elf_sections(_program_data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+fn parse_elf_sections(program_data: &[u8]) -> Result<Vec<ElfSection>> {
     let mut sections = Vec::new();
     
-    // Validate ELF header
-    if _program_data.len() < 64 {
-        return Err(anyhow!("Program data too small for ELF header"));
+    // Check ELF header
+    if program_data.len() < 64 {
+        return Err(anyhow!("Program data too small to be a valid ELF file"));
     }
-    
-    if _program_data[0] != 0x7F || _program_data[1] != b'E' || 
-       _program_data[2] != b'L' || _program_data[3] != b'F' {
-        return Err(anyhow!("Invalid ELF header"));
-    }
-    
-    // Parse ELF header
-    // ELF64 header structure:
-    // e_ident[16], e_type[2], e_machine[2], e_version[4], e_entry[8],
-    // e_phoff[8], e_shoff[8], e_flags[4], e_ehsize[2], e_phentsize[2],
-    // e_phnum[2], e_shentsize[2], e_shnum[2], e_shstrndx[2]
     
     // Get section header offset (e_shoff)
-    let sh_offset = u64::from_le_bytes([
-        _program_data[40], _program_data[41], _program_data[42], _program_data[43],
-        _program_data[44], _program_data[45], _program_data[46], _program_data[47]
-    ]) as usize;
+    let sh_offset = u64::from_le_bytes(program_data[40..48].try_into().unwrap()) as usize;
     
     // Get section header entry size (e_shentsize)
-    let sh_entsize = u16::from_le_bytes([_program_data[58], _program_data[59]]) as usize;
+    let sh_entsize = u16::from_le_bytes(program_data[58..60].try_into().unwrap()) as usize;
     
     // Get number of section headers (e_shnum)
-    let sh_num = u16::from_le_bytes([_program_data[60], _program_data[61]]) as usize;
+    let sh_num = u16::from_le_bytes(program_data[60..62].try_into().unwrap()) as usize;
     
     // Get section header string table index (e_shstrndx)
-    let sh_strndx = u16::from_le_bytes([_program_data[62], _program_data[63]]) as usize;
+    let sh_strndx = u16::from_le_bytes(program_data[62..64].try_into().unwrap()) as usize;
     
-    if sh_offset == 0 || sh_num == 0 {
-        return Err(anyhow!("No section headers found"));
+    if sh_offset == 0 || sh_entsize == 0 || sh_num == 0 {
+        return Err(anyhow!("Invalid ELF section header information"));
     }
     
-    // First, find the string table section
-    if sh_strndx >= sh_num || sh_offset + sh_strndx * sh_entsize + 64 > _program_data.len() {
-        return Err(anyhow!("Invalid section header string table index"));
-    }
-    
-    // Section header structure:
-    // sh_name[4], sh_type[4], sh_flags[8], sh_addr[8],
-    // sh_offset[8], sh_size[8], sh_link[4], sh_info[4],
-    // sh_addralign[8], sh_entsize[8]
-    
-    // Get string table offset and size
+    // Get section header string table
     let str_hdr_offset = sh_offset + sh_strndx * sh_entsize;
-    let _str_name_offset = u32::from_le_bytes([
-        _program_data[str_hdr_offset], 
-        _program_data[str_hdr_offset + 1],
-        _program_data[str_hdr_offset + 2], 
-        _program_data[str_hdr_offset + 3]
-    ]) as usize;
-    
-    let str_offset = u64::from_le_bytes([
-        _program_data[str_hdr_offset + 24], _program_data[str_hdr_offset + 25],
-        _program_data[str_hdr_offset + 26], _program_data[str_hdr_offset + 27],
-        _program_data[str_hdr_offset + 28], _program_data[str_hdr_offset + 29],
-        _program_data[str_hdr_offset + 30], _program_data[str_hdr_offset + 31]
-    ]) as usize;
-    
-    let str_size = u64::from_le_bytes([
-        _program_data[str_hdr_offset + 32], _program_data[str_hdr_offset + 33],
-        _program_data[str_hdr_offset + 34], _program_data[str_hdr_offset + 35],
-        _program_data[str_hdr_offset + 36], _program_data[str_hdr_offset + 37],
-        _program_data[str_hdr_offset + 38], _program_data[str_hdr_offset + 39]
-    ]) as usize;
-    
-    if str_offset + str_size > _program_data.len() {
-        return Err(anyhow!("String table extends beyond program data"));
+    if str_hdr_offset + 24 >= program_data.len() {
+        return Err(anyhow!("Invalid section header string table offset"));
     }
     
-    let string_table = &_program_data[str_offset..str_offset + str_size];
+    let str_offset = u64::from_le_bytes(program_data[str_hdr_offset + 24..str_hdr_offset + 32].try_into().unwrap()) as usize;
+    let str_size = u64::from_le_bytes(program_data[str_hdr_offset + 32..str_hdr_offset + 40].try_into().unwrap()) as usize;
     
-    // Now parse all section headers
+    if str_offset + str_size > program_data.len() {
+        return Err(anyhow!("Invalid section header string table data"));
+    }
+    
+    let str_table = &program_data[str_offset..str_offset + str_size];
+    
+    // Parse section headers
     for i in 0..sh_num {
         let hdr_offset = sh_offset + i * sh_entsize;
-        
-        if hdr_offset + sh_entsize > _program_data.len() {
-            return Err(anyhow!("Section header extends beyond program data"));
-        }
-        
-        // Get section name offset in string table
-        let name_offset = u32::from_le_bytes([
-            _program_data[hdr_offset], 
-            _program_data[hdr_offset + 1],
-            _program_data[hdr_offset + 2], 
-            _program_data[hdr_offset + 3]
-        ]) as usize;
-        
-        // Get section offset and size
-        let section_offset = u64::from_le_bytes([
-            _program_data[hdr_offset + 24], _program_data[hdr_offset + 25],
-            _program_data[hdr_offset + 26], _program_data[hdr_offset + 27],
-            _program_data[hdr_offset + 28], _program_data[hdr_offset + 29],
-            _program_data[hdr_offset + 30], _program_data[hdr_offset + 31]
-        ]) as usize;
-        
-        let section_size = u64::from_le_bytes([
-            _program_data[hdr_offset + 32], _program_data[hdr_offset + 33],
-            _program_data[hdr_offset + 34], _program_data[hdr_offset + 35],
-            _program_data[hdr_offset + 36], _program_data[hdr_offset + 37],
-            _program_data[hdr_offset + 38], _program_data[hdr_offset + 39]
-        ]) as usize;
-        
-        // Skip empty sections
-        if section_size == 0 || section_offset == 0 {
+        if hdr_offset + sh_entsize > program_data.len() {
             continue;
         }
         
-        if section_offset + section_size > _program_data.len() {
-            return Err(anyhow!("Section extends beyond program data"));
+        // Get section name offset
+        let name_offset = u32::from_le_bytes(program_data[hdr_offset..hdr_offset + 4].try_into().unwrap()) as usize;
+        
+        // Get section offset
+        let offset = u64::from_le_bytes(program_data[hdr_offset + 24..hdr_offset + 32].try_into().unwrap()) as usize;
+        
+        // Get section size
+        let size = u64::from_le_bytes(program_data[hdr_offset + 32..hdr_offset + 40].try_into().unwrap()) as usize;
+        
+        // Get section address
+        let address = u64::from_le_bytes(program_data[hdr_offset + 16..hdr_offset + 24].try_into().unwrap()) as usize;
+        
+        if offset + size > program_data.len() {
+            continue;
         }
         
-        // Extract section name from string table
-        if name_offset >= string_table.len() {
-            continue; // Skip sections with invalid name offsets
+        // Extract section name
+        let mut name_end = name_offset;
+        while name_end < str_table.len() && str_table[name_end] != 0 {
+            name_end += 1;
         }
         
-        let name_end = string_table[name_offset..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(string_table.len() - name_offset);
-        
-        let name = String::from_utf8_lossy(&string_table[name_offset..name_offset + name_end]).to_string();
+        let name = if name_offset < str_table.len() {
+            String::from_utf8_lossy(&str_table[name_offset..name_end]).to_string()
+        } else {
+            format!("section_{}", i)
+        };
         
         // Extract section data
-        let section_data = _program_data[section_offset..section_offset + section_size].to_vec();
+        let data = program_data[offset..offset + size].to_vec();
         
-        sections.push((name, section_data));
+        sections.push(ElfSection {
+            name,
+            data,
+            address,
+            size,
+        });
     }
     
     if sections.is_empty() {
@@ -474,611 +409,648 @@ fn parse_elf_sections(_program_data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(sections)
 }
 
-/// Extract account structure definitions from program bytecode
-fn extract_accounts(program_data: &[u8]) -> Result<Vec<Account>> {
-    let mut accounts = Vec::new();
-    
-    // Parse ELF sections
-    let sections = parse_elf_sections(program_data)?;
-    
-    // Look for account structure definitions
-    // These are often in the form of struct definitions
-    for (section_name, section_data) in &sections {
-        if section_name == ".rodata" {
-            // Look for string patterns that might indicate account names
-            let account_names = find_account_names(&section_data);
-            
-            for name in account_names {
-                let mut account = Account::new(name.clone(), "data".to_string());
-                
-                // Try to infer fields
-                let fields = infer_account_fields(&section_data, &name);
-                for (field_name, field_type, offset) in fields {
-                    account.add_field(field_name, field_type, offset);
-                }
-                
-                accounts.push(account);
-            }
-        }
-    }
-    
-    // If we couldn't find any accounts, add a placeholder
-    if accounts.is_empty() {
-        let mut account = Account::new("State".to_string(), "state".to_string());
-        account.add_field("owner".to_string(), "pubkey".to_string(), 0);
-        account.add_field("data".to_string(), "u64".to_string(), 32);
-        accounts.push(account);
-    }
-    
-    Ok(accounts)
-}
-
-/// Find potential account names in the data
-fn find_account_names(data: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    
-    // Look for common account structure naming patterns
-    // 1. CamelCase names followed by "Account"
-    // 2. Common Solana account names
-    
-    // Convert data to a string for easier pattern matching
-    let data_str = String::from_utf8_lossy(data);
-    
-    // Common account name patterns
-    let patterns = [
-        "Account", "State", "Config", "Settings", "Data",
-        "Mint", "Token", "Escrow", "Vault", "Pool",
-        "Stake", "Vote", "Governance", "Treasury"
-    ];
-    
-    for pattern in patterns {
-        // Look for the pattern in the data
-        if data_str.contains(pattern) {
-            // Try to extract a full name (word before + pattern)
-            if let Some(pos) = data_str.find(pattern) {
-                if pos > 0 {
-                    // Look for the start of the word
-                    let start = data_str[..pos]
-                        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-                        .map_or(0, |p| p + 1);
-                    
-                    if start < pos {
-                        let prefix = &data_str[start..pos];
-                        if !prefix.is_empty() {
-                            names.push(format!("{}{}", prefix, pattern));
-                            continue;
-                        }
-                    }
-                }
-                
-                // If we couldn't extract a full name, just use the pattern
-                names.push(pattern.to_string());
-            }
-        }
-    }
-    
-    // Remove duplicates
-    names.sort();
-    names.dedup();
-    
-    names
-}
-
-/// Infer account fields from data
-fn infer_account_fields(data: &[u8], account_name: &str) -> Vec<(String, String, usize)> {
-    let mut fields = Vec::new();
-    
-    // Look for common field patterns in the data
-    // 1. Field names followed by types
-    // 2. Common field names in Solana accounts
-    
-    // Convert data to a string for easier pattern matching
-    let data_str = String::from_utf8_lossy(data);
-    
-    // Common field names and types
-    let common_fields = [
-        ("owner", "pubkey", 0),
-        ("authority", "pubkey", 0),
-        ("mint", "pubkey", 32),
-        ("balance", "u64", 32),
-        ("amount", "u64", 32),
-        ("supply", "u64", 32),
-        ("decimals", "u8", 40),
-        ("initialized", "bool", 41),
-        ("delegate", "pubkey", 42),
-        ("state", "u8", 74),
-        ("is_native", "bool", 75),
-    ];
-    
-    // Add fields based on account name
-    if account_name.contains("Token") {
-        fields.push(("mint".to_string(), "pubkey".to_string(), 0));
-        fields.push(("owner".to_string(), "pubkey".to_string(), 32));
-        fields.push(("amount".to_string(), "u64".to_string(), 64));
-        fields.push(("delegate".to_string(), "pubkey".to_string(), 72));
-        fields.push(("state".to_string(), "u8".to_string(), 104));
-        fields.push(("is_native".to_string(), "bool".to_string(), 105));
-    } else if account_name.contains("Mint") {
-        fields.push(("mint_authority".to_string(), "pubkey".to_string(), 0));
-        fields.push(("supply".to_string(), "u64".to_string(), 32));
-        fields.push(("decimals".to_string(), "u8".to_string(), 40));
-        fields.push(("is_initialized".to_string(), "bool".to_string(), 41));
-        fields.push(("freeze_authority".to_string(), "pubkey".to_string(), 42));
-    } else if account_name.contains("State") || account_name.contains("Config") {
-        fields.push(("authority".to_string(), "pubkey".to_string(), 0));
-        fields.push(("initialized".to_string(), "bool".to_string(), 32));
-        fields.push(("version".to_string(), "u8".to_string(), 33));
-        fields.push(("data".to_string(), "u64".to_string(), 34));
-    } else {
-        // For other account types, add common fields
-        for (name, type_name, offset) in common_fields.iter() {
-            if data_str.contains(name) {
-                fields.push((name.to_string(), type_name.to_string(), *offset));
-            }
-        }
-        
-        // If we couldn't find any fields, add some defaults
-        if fields.is_empty() {
-            fields.push(("owner".to_string(), "pubkey".to_string(), 0));
-            fields.push(("data".to_string(), "u64".to_string(), 32));
-        }
-    }
-    
-    fields
-}
-
-/// Detect if the program is an Anchor program
-pub fn is_anchor_program(program_data: &[u8]) -> bool {
-    find_pattern(program_data, b"anchor_") || 
-    find_pattern(program_data, b"Anchor") ||
-    find_pattern(program_data, b"IDL")
-}
-
-/// Extract Anchor program metadata if available
-pub fn extract_anchor_metadata(program_data: &[u8]) -> Option<String> {
-    if is_anchor_program(program_data) {
-        Some("Anchor Program".to_string())
-    } else {
-        None
-    }
-}
-
-/// Find a byte pattern in the program data
-fn find_pattern(data: &[u8], pattern: &[u8]) -> bool {
-    data.windows(pattern.len()).any(|window| window == pattern)
-}
-
-/// Extract error codes from program bytecode
-pub fn extract_error_codes(program_data: &[u8]) -> Vec<(u32, String)> {
-    let mut errors = Vec::new();
-    
-    // Look for common error patterns in the bytecode
-    // 1. Error strings followed by error codes
-    // 2. Error enums
-    
-    // Convert data to a string for easier pattern matching
-    let data_str = String::from_utf8_lossy(program_data);
-    
-    // Look for error patterns
-    let error_patterns = [
-        "Error", "Failed", "Invalid", "Unauthorized", "Insufficient",
-        "NotFound", "AlreadyExists", "Overflow", "Underflow"
-    ];
-    
-    for pattern in error_patterns {
-        // Find all occurrences of the pattern
-        let mut start = 0;
-        while let Some(pos) = data_str[start..].find(pattern) {
-            let pos = start + pos;
-            
-            // Look for a number near the error string
-            let end = std::cmp::min(pos + 100, data_str.len());
-            let context = &data_str[pos..end];
-            
-            // Simple heuristic: look for numbers in the context
-            let mut code = 0;
-            for (i, c) in context.char_indices() {
-                if c.is_digit(10) {
-                    // Found a digit, try to parse a number
-                    let end_digit = context[i..].find(|c: char| !c.is_digit(10))
-                        .map(|e| i + e)
-                        .unwrap_or(context.len());
-                    
-                    if let Ok(num) = context[i..end_digit].parse::<u32>() {
-                        code = num;
-                        break;
-                    }
-                }
-            }
-            
-            // Extract error name
-            let name_end = context.find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(context.len());
-            let name = context[0..name_end].to_string();
-            
-            // Add error if we found a code
-            if code > 0 {
-                errors.push((code, name));
-            }
-            
-            // Move to next position
-            start = pos + 1;
-        }
-    }
-    
-    // Remove duplicates
-    errors.sort_by_key(|(code, _)| *code);
-    errors.dedup_by_key(|(code, _)| *code);
-    
-    errors
-}
-
-/// Find instruction dispatch table in the program bytecode
-fn find_instruction_dispatch(program_data: &[u8]) -> Vec<(usize, u8)> {
-    let mut dispatch_points = Vec::new();
-    
-    // Parse ELF sections
-    if let Ok(sections) = parse_elf_sections(program_data) {
-        // Look for instruction dispatch in .text section
-        for (section_name, section_data) in &sections {
-            if section_name == ".text" {
-                // Look for common instruction dispatch patterns
-                
-                // Pattern 1: Switch statement with sequential comparisons
-                // This often looks like a series of CMP instructions followed by JE/JNE
-                for i in 0..section_data.len().saturating_sub(10) {
-                    // Check for CMP instruction followed by conditional jump
-                    if (section_data[i] == 0x80 && section_data[i+1] == 0x3D) || // CMP BYTE PTR [reg], imm8
-                       (section_data[i] == 0x3C) || // CMP AL, imm8
-                       (section_data[i] == 0x83 && (section_data[i+1] & 0xF8) == 0xF8) { // CMP reg, imm8
-                        
-                        // Get the comparison value (instruction index)
-                        let value_offset = if section_data[i] == 0x3C { i + 1 } 
-                                          else if section_data[i] == 0x80 { i + 3 }
-                                          else { i + 2 };
-                        
-                        if value_offset < section_data.len() {
-                            let value = section_data[value_offset];
-                            
-                            // Check if this is followed by a conditional jump (JE/JNE)
-                            if i + 5 < section_data.len() && 
-                               (section_data[i+4] == 0x74 || section_data[i+4] == 0x75) {
-                                dispatch_points.push((i, value));
-                            }
-                        }
-                    }
-                }
-                
-                // Pattern 2: Jump table based on instruction index
-                // This often looks like a bounds check followed by an indirect jump
-                for i in 0..section_data.len().saturating_sub(15) {
-                    // Check for bounds check (CMP reg, imm8 where imm8 is likely the max instruction index)
-                    if section_data[i] == 0x83 && section_data[i+1] == 0xF8 && section_data[i+2] > 0 && section_data[i+2] < 20 {
-                        let max_index = section_data[i+2];
-                        
-                        // Check for jump table pattern (often uses LEA and JMP instructions)
-                        if i + 10 < section_data.len() && section_data[i+5] == 0xFF && section_data[i+6] == 0x24 {
-                            // Found a likely jump table
-                            // Add entries for all possible instruction indices
-                            for idx in 0..=max_index {
-                                dispatch_points.push((i, idx));
-                            }
-                        }
-                    }
-                }
-                
-                // Pattern 3: Function pointer table
-                // This is harder to detect reliably, but we can look for arrays of pointers
-                // in the .rodata or .data sections
-            }
-        }
-    }
-    
-    // Remove duplicates and sort by instruction index
-    dispatch_points.sort_by_key(|&(_, idx)| idx);
-    dispatch_points.dedup_by_key(|&mut (_, idx)| idx);
-    
-    dispatch_points
-}
-
-/// Extract more detailed instruction information
-fn extract_detailed_instructions(program_data: &[u8]) -> Result<Vec<Instruction>> {
-    info!("Using improved instruction detection...");
+/// Parse instructions from a byte slice
+fn parse_instructions(data: &[u8], base_address: usize) -> Result<Vec<SbfInstruction>> {
     let mut instructions = Vec::new();
+    let mut offset = 0;
     
-    // Find instruction dispatch points
-    let dispatch_points = find_instruction_dispatch(program_data);
-    info!("Found {} potential instruction dispatch points", dispatch_points.len());
-    
-    // Parse ELF sections
-    let sections = parse_elf_sections(program_data)?;
-    
-    // Extract string table for name inference
-    let string_table = sections.iter()
-        .find(|(name, _)| name == ".strtab" || name == ".rodata")
-        .map(|(_, data)| data.as_slice())
-        .unwrap_or(&[]);
-    
-    // Process each dispatch point
-    for (offset, idx) in dispatch_points {
-        // Create basic instruction
-        let mut instruction = Instruction::new(
-            format!("instruction_{}", idx),
-            idx
-        );
-        
-        // Try to infer a better name
-        if let Some(name) = infer_instruction_name(string_table, idx) {
-            instruction.name = name;
-        }
-        
-        // Find the code section
-        if let Some((_, code_section)) = sections.iter().find(|(name, _)| name == ".text") {
-            // Analyze the code after this dispatch point to infer parameters
-            let param_types = infer_parameters(code_section, offset);
-            for (i, param_type) in param_types.iter().enumerate() {
-                instruction.add_arg(format!("param{}", i), param_type.clone());
-            }
-            
-            // Infer required accounts
-            let accounts = infer_accounts(code_section, offset);
-            for (i, (is_signer, is_writable)) in accounts.iter().enumerate() {
-                instruction.add_account(
-                    format!("account{}", i),
-                    *is_signer,
-                    *is_writable,
-                    false
-                );
-            }
-        }
-        
-        instructions.push(instruction);
-    }
-    
-    // If we couldn't find any instructions, add placeholders for common ones
-    if instructions.is_empty() {
-        add_placeholder_instructions(&mut instructions);
+    while offset + 8 <= data.len() {
+        let insn = SbfInstruction::parse(&data[offset..offset + 8], base_address + offset)?;
+        instructions.push(insn);
+        offset += 8;
     }
     
     Ok(instructions)
 }
 
-/// Try to infer instruction name from string table and index
-fn infer_instruction_name(string_table: &[u8], idx: u8) -> Option<String> {
-    // Common instruction names by index for known programs
-    match idx {
-        0 => Some("initialize".to_string()),
-        1 => Some("transfer".to_string()),
-        2 => Some("approve".to_string()),
-        3 => Some("revoke".to_string()),
-        4 => Some("setAuthority".to_string()),
-        5 => Some("mintTo".to_string()),
-        6 => Some("burn".to_string()),
-        7 => Some("closeAccount".to_string()),
-        8 => Some("freezeAccount".to_string()),
-        9 => Some("thawAccount".to_string()),
-        _ => None,
+/// Build a control flow graph from instructions
+fn build_control_flow_graph(instructions: &[SbfInstruction]) -> Result<(Vec<BasicBlock>, Vec<Function>)> {
+    let mut blocks = Vec::new();
+    let mut functions = Vec::new();
+    
+    if instructions.is_empty() {
+        return Ok((blocks, functions));
     }
     
-    // If we didn't match a common index, try to find a name in the string table
-    // This is more complex and would involve scanning for function name patterns
-    // in the string table that might correspond to instruction handlers
-}
-
-/// Add placeholder instructions for common programs
-fn add_placeholder_instructions(instructions: &mut Vec<Instruction>) {
-    info!("Adding placeholder instructions for Token program...");
+    // Find basic block boundaries
+    let mut boundaries = Vec::new();
+    boundaries.push(0); // First instruction is always a boundary
     
-    // Token program common instructions
-    let mut init_mint = Instruction::new("initializeMint".to_string(), 0);
-    init_mint.add_arg("decimals".to_string(), "u8".to_string());
-    init_mint.add_arg("mintAuthority".to_string(), "pubkey".to_string());
-    init_mint.add_arg("freezeAuthority".to_string(), "pubkey".to_string());
-    init_mint.add_account("mint".to_string(), false, true, false);
-    init_mint.add_account("rent".to_string(), false, false, false);
-    
-    // Add more instructions...
-    
-    instructions.push(init_mint);
-    // Push other instructions...
-    
-    info!("Added {} placeholder instructions", instructions.len());
-}
-
-/// Deduplicate accounts with similar structures
-fn deduplicate_accounts(accounts: Vec<Account>) -> Vec<Account> {
-    let mut unique_accounts = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-    
-    for account in accounts {
-        if !seen_names.contains(&account.name) {
-            seen_names.insert(account.name.clone());
-            unique_accounts.push(account);
+    for (i, insn) in instructions.iter().enumerate() {
+        if insn.is_jump() {
+            // End of current block
+            boundaries.push(i + 1);
+            
+            // Target of jump is a new block
+            let target_offset = insn.address + 8 + (insn.offset as isize * 8) as usize;
+            let target_idx = instructions.iter()
+                .position(|i| i.address == target_offset);
+            
+            if let Some(idx) = target_idx {
+                boundaries.push(idx);
+            }
+        } else if insn.is_exit() {
+            // End of current block
+            boundaries.push(i + 1);
         }
     }
     
-    unique_accounts
+    // Sort and deduplicate boundaries
+    boundaries.sort();
+    boundaries.dedup();
+    
+    // Create basic blocks
+    for i in 0..boundaries.len() - 1 {
+        let start = boundaries[i];
+        let end = boundaries[i + 1];
+        
+        if start < instructions.len() && end <= instructions.len() {
+            let block_instructions = instructions[start..end].to_vec();
+            
+            let block = BasicBlock {
+                start: instructions[start].address,
+                end: if end < instructions.len() {
+                    instructions[end].address
+                } else {
+                    instructions[end - 1].address + 8
+                },
+                instructions: block_instructions,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+            };
+            
+            blocks.push(block);
+        }
+    }
+    
+    // Add the last block if needed
+    if let Some(&last) = boundaries.last() {
+        if last < instructions.len() {
+            let block_instructions = instructions[last..].to_vec();
+            
+            let block = BasicBlock {
+                start: instructions[last].address,
+                end: instructions.last().map(|i| i.address + 8).unwrap_or(0),
+                instructions: block_instructions,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+            };
+            
+            blocks.push(block);
+        }
+    }
+    
+    // Store pending predecessor updates to avoid borrow checker issues
+    let mut pending_predecessors = Vec::new();
+    
+    // Connect blocks
+    for (i, block) in blocks.iter_mut().enumerate() {
+        if let Some(last_insn) = block.instructions.last() {
+            if last_insn.is_jump() {
+                // Add the jump target as a successor
+                let target_addr = last_insn.address + 8 + (last_insn.offset as isize * 8) as usize;
+                
+                // Find the block containing this address
+                let target_idx = blocks.iter().position(|b| b.start <= target_addr && target_addr < b.end);
+                if let Some(idx) = target_idx {
+                    block.successors.push(idx);
+                    // Store the index to update later
+                    pending_predecessors.push((idx, i));
+                }
+                
+                // For conditional jumps, also add the fall-through block
+                if last_insn.opcode != opcodes::JA {
+                    if i + 1 < blocks.len() {
+                        block.successors.push(i + 1);
+                        pending_predecessors.push((i + 1, i));
+                    }
+                }
+            } else if !last_insn.is_exit() {
+                // For non-jump, non-exit instructions, add the fall-through block
+                if i + 1 < blocks.len() {
+                    block.successors.push(i + 1);
+                    pending_predecessors.push((i + 1, i));
+                }
+            }
+        }
+    }
+    
+    // Apply the pending predecessor updates
+    for (block_idx, pred_idx) in pending_predecessors {
+        blocks[block_idx].predecessors.push(pred_idx);
+    }
+    
+    // Identify functions
+    // For now, we'll just create a single function for the entire program
+    let mut function = Function {
+        name: "main".to_string(),
+        entry: blocks[0].start,
+        exits: Vec::new(),
+        blocks: (0..blocks.len()).collect(),
+    };
+    
+    // Find exit points
+    for (i, block) in blocks.iter().enumerate() {
+        if let Some(last_insn) = block.instructions.last() {
+            if last_insn.is_exit() {
+                function.exits.push(i);
+            }
+        }
+    }
+    
+    functions.push(function);
+    
+    Ok((blocks, functions))
 }
 
-/// Scan for instruction names in the string table
-fn scan_for_instruction_names(string_table: &[u8]) -> Vec<(String, u8)> {
-    let mut names = Vec::new();
-    let str_data = String::from_utf8_lossy(string_table);
+/// Extract strings from .rodata section
+fn extract_strings(data: &[u8]) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut start = 0;
     
-    // Common instruction name patterns
-    let patterns = [
-        "process_instruction", "handle_instruction", "ix_", 
-        "initialize", "transfer", "mint", "burn", "approve",
-        "create", "update", "delete", "close", "freeze", "thaw"
-    ];
-    
-    for pattern in patterns {
-        let mut start = 0;
-        while let Some(pos) = str_data[start..].find(pattern) {
-            let pos = start + pos;
-            
-            // Try to extract a full function name
-            let name_start = pos;
-            let name_end = str_data[pos..].find(|c: char| !c.is_alphanumeric() && c != '_')
-                .map(|end| pos + end)
-                .unwrap_or(str_data.len());
-            
-            if name_end > name_start {
-                let name = str_data[name_start..name_end].to_string();
-                
-                // Try to extract an index from the name or context
-                // This is a heuristic and might not always work
-                if let Some(idx) = extract_index_from_name(&name) {
-                    names.push((name, idx));
+    while start < data.len() {
+        // Find the next null terminator
+        if let Some(end) = data[start..].iter().position(|&b| b == 0) {
+            if end > 0 {
+                // Extract the string
+                if let Ok(s) = std::str::from_utf8(&data[start..start + end]) {
+                    if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                        strings.push(s.to_string());
+                    }
                 }
             }
             
-            start = pos + 1;
+            // Move past the null terminator
+            start += end + 1;
+        } else {
+            // No more null terminators
+            break;
         }
     }
     
-    names
+    strings
 }
 
-/// Try to extract an instruction index from a function name
-fn extract_index_from_name(name: &str) -> Option<u8> {
-    // Check for common patterns like "process_instruction_0" or "ix_3"
-    if let Some(pos) = name.rfind(|c: char| !c.is_digit(10)) {
-        if pos + 1 < name.len() {
-            if let Ok(idx) = name[pos+1..].parse::<u8>() {
-                return Some(idx);
+/// Detect if this is an Anchor program
+fn detect_anchor_program(instructions: &[SbfInstruction], strings: &[String]) -> bool {
+    // Check for Anchor's characteristic log message pattern
+    if strings.iter().any(|s| s.contains("Instruction: ")) {
+        return true;
+    }
+    
+    // Check for Anchor's error code patterns
+    if strings.iter().any(|s| 
+        s.contains("ConstraintMut") || 
+        s.contains("ConstraintSigner") || 
+        s.contains("ConstraintRentExempt")
+    ) {
+        return true;
+    }
+    
+    // Check for Anchor's discriminator generation pattern
+    if strings.iter().any(|s| s.contains("global:")) {
+        return true;
+    }
+    
+    // Check for Anchor's account validation pattern
+    if strings.iter().any(|s| s.contains("AccountDiscriminatorNotFound")) {
+        return true;
+    }
+    
+    // Look for 8-byte discriminator patterns
+    // This is a more complex check that looks for common Anchor instruction dispatch patterns
+    let mut consecutive_comparisons = 0;
+    let mut last_comparison_offset = 0;
+    
+    for (i, insn) in instructions.iter().enumerate() {
+        // Look for comparison instructions
+        if matches!(insn.opcode, opcodes::JEQ_REG | opcodes::JEQ_IMM | opcodes::JNE_REG | opcodes::JNE_IMM) {
+            if last_comparison_offset > 0 && i - last_comparison_offset <= 10 {
+                consecutive_comparisons += 1;
+                if consecutive_comparisons >= 7 {  // Need 8 bytes, but allow for some flexibility
+                    return true;
+                }
+            } else {
+                consecutive_comparisons = 1;
+            }
+            
+            last_comparison_offset = i;
+        }
+    }
+    
+    false
+}
+
+/// Find instruction handlers in an Anchor program
+fn find_anchor_instruction_handlers(
+    instructions: &[SbfInstruction], 
+    blocks: &[BasicBlock],
+    strings: &[String]
+) -> Vec<InstructionHandler> {
+    let mut handlers = Vec::new();
+    
+    // Extract instruction names from strings
+    let instruction_names: Vec<_> = strings.iter()
+        .filter_map(|s| {
+            if s.starts_with("Instruction: ") {
+                Some(s[12..].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    // Look for discriminator comparisons
+    for (i, block) in blocks.iter().enumerate() {
+        // Check if this block contains a discriminator comparison
+        let mut has_discriminator_check = false;
+        let mut discriminator = [0u8; 8];
+        
+        for window in block.instructions.windows(3) {
+            // Look for a pattern like:
+            // ldxdw r0, [r1+0]   // Load 8-byte discriminator
+            // mov r1, <imm>      // Load immediate value (part of discriminator)
+            // jeq r0, r1, +12    // Compare and jump
+            
+            if window[0].is_load() && 
+               window[0].mem_size() == Some(8) && 
+               window[1].opcode == opcodes::MOV_IMM && 
+               window[2].opcode == opcodes::JEQ_REG {
+                
+                has_discriminator_check = true;
+                
+                // Extract the discriminator (this is simplified)
+                discriminator[0..4].copy_from_slice(&window[1].imm.to_le_bytes());
+                
+                // We'd need to track more instructions to get the full 8 bytes
+                break;
+            }
+        }
+        
+        if has_discriminator_check && i < instruction_names.len() {
+            // Create a handler for this instruction
+            let name = instruction_names[i].clone();
+            
+            // Generate the full discriminator using Anchor's algorithm
+            let full_discriminator = generate_anchor_discriminator(&name);
+            
+            let handler = InstructionHandler {
+                name,
+                entry: block.start,
+                discriminator: None,
+                anchor_discriminator: Some(full_discriminator),
+                parameters: infer_parameters(block),
+                accounts: infer_accounts(block),
+            };
+            
+            handlers.push(handler);
+        }
+    }
+    
+    handlers
+}
+
+/// Generate an Anchor instruction discriminator
+fn generate_anchor_discriminator(name: &str) -> [u8; 8] {
+    let namespace = format!("global:{}", name);
+    let hash_bytes = hash(namespace.as_bytes()).to_bytes();
+    let mut result = [0u8; 8];
+    result.copy_from_slice(&hash_bytes[..8]);
+    result
+}
+
+/// Find instruction handlers in a non-Anchor program
+fn find_instruction_handlers(
+    instructions: &[SbfInstruction],
+    blocks: &[BasicBlock],
+    functions: &[Function],
+    strings: &[String]
+) -> Vec<InstructionHandler> {
+    let mut handlers = Vec::new();
+    
+    // Look for instruction dispatch patterns
+    for block in blocks {
+        // Check if this block contains an instruction dispatch pattern
+        let mut has_dispatch = false;
+        let mut discriminator = None;
+        
+        for window in block.instructions.windows(3) {
+            // Look for a pattern like:
+            // ldxb r0, [r1+0]   // Load discriminator byte
+            // jeq r0, <imm>, +12 // Compare and jump if equal
+            
+            if window[0].is_load() && 
+               window[0].mem_size() == Some(1) && 
+               window[0].dst_reg == 0 && 
+               (window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM) {
+                
+                has_dispatch = true;
+                discriminator = Some(window[1].imm as u8);
+                break;
+            }
+        }
+        
+        if has_dispatch {
+            // Try to find a name for this instruction
+            let name = find_instruction_name(block, strings)
+                .unwrap_or_else(|| format!("instruction_{}", discriminator.unwrap_or(0)));
+            
+            let handler = InstructionHandler {
+                name,
+                entry: block.start,
+                discriminator,
+                anchor_discriminator: None,
+                parameters: infer_parameters(block),
+                accounts: infer_accounts(block),
+            };
+            
+            handlers.push(handler);
+        }
+    }
+    
+    // If we couldn't find any handlers, create a generic one
+    if handlers.is_empty() {
+        handlers.push(InstructionHandler {
+            name: "process".to_string(),
+            entry: 0,
+            discriminator: Some(0),
+            anchor_discriminator: None,
+            parameters: vec!["bytes".to_string()],
+            accounts: Vec::new(),
+        });
+    }
+    
+    handlers
+}
+
+/// Find a name for an instruction handler
+fn find_instruction_name(block: &BasicBlock, strings: &[String]) -> Option<String> {
+    // Look for log messages that might indicate the instruction name
+    for insn in &block.instructions {
+        if insn.is_call() && insn.imm as u32 == syscalls::SOL_LOG {
+            // This is a call to sol_log, try to find the string being logged
+            // This is a simplified approach - in a real implementation, we would
+            // track register values to find the string pointer
+            
+            // Look for common instruction name patterns in strings
+            for s in strings {
+                let lower = s.to_lowercase();
+                for pattern in &[
+                    "initialize", "create", "update", "delete", "transfer", "mint", "burn",
+                    "approve", "revoke", "freeze", "thaw", "close", "set", "get"
+                ] {
+                    if lower.contains(pattern) {
+                        return Some(s.clone());
+                    }
+                }
             }
         }
     }
     
-    // Check for known instruction names
-    match name.to_lowercase().as_str() {
-        s if s.contains("initialize_mint") => Some(0),
-        s if s.contains("initialize_account") => Some(1),
-        s if s.contains("initialize_multisig") => Some(2),
-        s if s.contains("transfer") => Some(3),
-        s if s.contains("approve") => Some(4),
-        s if s.contains("revoke") => Some(5),
-        s if s.contains("set_authority") => Some(6),
-        s if s.contains("mint_to") => Some(7),
-        s if s.contains("burn") => Some(8),
-        s if s.contains("close_account") => Some(9),
-        s if s.contains("freeze_account") => Some(10),
-        s if s.contains("thaw_account") => Some(11),
-        s if s.contains("transfer_checked") => Some(12),
-        s if s.contains("approve_checked") => Some(13),
-        s if s.contains("mint_to_checked") => Some(14),
-        s if s.contains("burn_checked") => Some(15),
-        _ => None,
+    None
+}
+
+/// Infer parameter types from a basic block
+fn infer_parameters(block: &BasicBlock) -> Vec<String> {
+    let mut parameters = Vec::new();
+    
+    // Look for memory loads that might indicate parameter access
+    for window in block.instructions.windows(2) {
+        if window[0].is_load() {
+            // This is a load instruction, check the size
+            if let Some(size) = window[0].mem_size() {
+                match size {
+                    1 => parameters.push("u8".to_string()),
+                    2 => parameters.push("u16".to_string()),
+                    4 => parameters.push("u32".to_string()),
+                    8 => {
+                        // This could be a u64 or a pubkey
+                        // Check if it's used in a pubkey-specific way
+                        if is_pubkey_usage(&block.instructions, window[0].dst_reg) {
+                            parameters.push("pubkey".to_string());
+                        } else {
+                            parameters.push("u64".to_string());
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
     }
+    
+    // Deduplicate parameters
+    parameters.sort();
+    parameters.dedup();
+    
+    // If we couldn't infer any parameters, add a generic one
+    if parameters.is_empty() {
+        parameters.push("bytes".to_string());
+    }
+    
+    parameters
 }
 
-/// Detect if the program is a Token program
-pub fn is_token_program(program_data: &[u8]) -> bool {
-    // Look for token program signatures in the bytecode
-    find_pattern(program_data, b"Token program") || 
-    find_pattern(program_data, b"spl-token") ||
-    find_pattern(program_data, b"TokenkegQ")
+/// Check if a register is used as a pubkey
+fn is_pubkey_usage(instructions: &[SbfInstruction], reg: u8) -> bool {
+    for insn in instructions {
+        if insn.is_call() {
+            // Check if this is a call to a pubkey-related syscall
+            let syscall_hash = insn.imm as u32;
+            if syscall_hash == syscalls::SOL_LOG_PUBKEY ||
+               syscall_hash == syscalls::SOL_CREATE_PROGRAM_ADDRESS ||
+               syscall_hash == syscalls::SOL_TRY_FIND_PROGRAM_ADDRESS {
+                // This is a pubkey-related syscall
+                // Check if our register is used as an argument
+                // This is a simplified approach - in a real implementation, we would
+                // track register values more carefully
+                if insn.src_reg == reg || insn.dst_reg == reg {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
 }
 
-/// Analyze a Token program
-fn analyze_token_program(_program_data: &[u8]) -> Result<BytecodeAnalysis> {
-    info!("Using specialized Token program analysis");
-    let mut instructions = Vec::new();
-    
-    // Add known Token program instructions
-    let mut init_mint = Instruction::new("initializeMint".to_string(), 0);
-    init_mint.add_arg("decimals".to_string(), "u8".to_string());
-    init_mint.add_arg("mintAuthority".to_string(), "pubkey".to_string());
-    init_mint.add_arg("freezeAuthority".to_string(), "pubkey".to_string());
-    init_mint.add_account("mint".to_string(), false, true, false);
-    init_mint.add_account("rent".to_string(), false, false, false);
-    
-    let mut init_account = Instruction::new("initializeAccount".to_string(), 1);
-    init_account.add_account("account".to_string(), false, true, false);
-    init_account.add_account("mint".to_string(), false, false, false);
-    init_account.add_account("owner".to_string(), false, false, false);
-    init_account.add_account("rent".to_string(), false, false, false);
-    
-    let mut transfer = Instruction::new("transfer".to_string(), 3);
-    transfer.add_arg("amount".to_string(), "u64".to_string());
-    transfer.add_account("source".to_string(), false, true, false);
-    transfer.add_account("destination".to_string(), false, true, false);
-    transfer.add_account("authority".to_string(), true, false, false);
-    
-    let mut approve = Instruction::new("approve".to_string(), 4);
-    approve.add_arg("amount".to_string(), "u64".to_string());
-    approve.add_account("source".to_string(), false, true, false);
-    approve.add_account("delegate".to_string(), false, false, false);
-    approve.add_account("owner".to_string(), true, false, false);
-    
-    let mut revoke = Instruction::new("revoke".to_string(), 5);
-    revoke.add_account("source".to_string(), false, true, false);
-    revoke.add_account("owner".to_string(), true, false, false);
-    
-    let mut set_authority = Instruction::new("setAuthority".to_string(), 6);
-    set_authority.add_arg("authorityType".to_string(), "u8".to_string());
-    set_authority.add_arg("newAuthority".to_string(), "pubkey".to_string());
-    set_authority.add_account("account".to_string(), false, true, false);
-    set_authority.add_account("currentAuthority".to_string(), true, false, false);
-    
-    let mut mint_to = Instruction::new("mintTo".to_string(), 7);
-    mint_to.add_arg("amount".to_string(), "u64".to_string());
-    mint_to.add_account("mint".to_string(), false, true, false);
-    mint_to.add_account("destination".to_string(), false, true, false);
-    mint_to.add_account("authority".to_string(), true, false, false);
-    
-    let mut burn = Instruction::new("burn".to_string(), 8);
-    burn.add_arg("amount".to_string(), "u64".to_string());
-    burn.add_account("account".to_string(), false, true, false);
-    burn.add_account("mint".to_string(), false, true, false);
-    burn.add_account("owner".to_string(), true, false, false);
-    
-    let mut close_account = Instruction::new("closeAccount".to_string(), 9);
-    close_account.add_account("account".to_string(), false, true, false);
-    close_account.add_account("destination".to_string(), false, true, false);
-    close_account.add_account("owner".to_string(), true, false, false);
-    
-    instructions.push(init_mint);
-    instructions.push(init_account);
-    instructions.push(transfer);
-    instructions.push(approve);
-    instructions.push(revoke);
-    instructions.push(set_authority);
-    instructions.push(mint_to);
-    instructions.push(burn);
-    instructions.push(close_account);
-    
-    // Add known Token program accounts
+/// Infer account usage from a basic block
+fn infer_accounts(block: &BasicBlock) -> Vec<(String, bool, bool)> {
     let mut accounts = Vec::new();
     
-    let mut token_account = Account::new("Token".to_string(), "token".to_string());
-    token_account.add_field("mint".to_string(), "pubkey".to_string(), 0);
-    token_account.add_field("owner".to_string(), "pubkey".to_string(), 32);
-    token_account.add_field("amount".to_string(), "u64".to_string(), 64);
-    token_account.add_field("delegate".to_string(), "pubkey".to_string(), 72);
-    token_account.add_field("state".to_string(), "u8".to_string(), 104);
-    token_account.add_field("is_native".to_string(), "bool".to_string(), 105);
+    // Look for account access patterns
+    for (i, window) in block.instructions.windows(3).enumerate() {
+        if window[0].is_load() && window[0].mem_size() == Some(8) {
+            // This might be loading an account pointer
+            let reg = window[0].dst_reg;
+            
+            // Check if the next instructions access fields of this account
+            if i + 3 < block.instructions.len() {
+                let next_insn = &block.instructions[i + 3];
+                if next_insn.is_load() && next_insn.src_reg == reg {
+                    // This is accessing a field of the account
+                    // Try to determine if it's checking is_signer or is_writable
+                    let is_signer = is_checking_signer(&block.instructions[i+3..]);
+                    let is_writable = is_checking_writable(&block.instructions[i+3..]);
+                    
+                    accounts.push((format!("account_{}", accounts.len()), is_signer, is_writable));
+                }
+            }
+        }
+    }
     
-    let mut mint_account = Account::new("Mint".to_string(), "mint".to_string());
-    mint_account.add_field("mint_authority".to_string(), "pubkey".to_string(), 0);
-    mint_account.add_field("supply".to_string(), "u64".to_string(), 32);
-    mint_account.add_field("decimals".to_string(), "u8".to_string(), 40);
-    mint_account.add_field("is_initialized".to_string(), "bool".to_string(), 41);
-    mint_account.add_field("freeze_authority".to_string(), "pubkey".to_string(), 42);
+    // If we couldn't infer any accounts, add some generic ones
+    if accounts.is_empty() {
+        accounts.push(("authority".to_string(), true, false));
+        accounts.push(("data".to_string(), false, true));
+    }
     
-    accounts.push(token_account);
-    accounts.push(mint_account);
-    
-    Ok(BytecodeAnalysis {
-        instructions,
-        accounts,
-    })
+    accounts
 }
 
-/// Create a minimal IDL when we can't analyze the program
-fn create_minimal_idl() -> Result<BytecodeAnalysis> {
-    info!("Creating minimal IDL for non-ELF program");
+/// Check if the instructions are checking the is_signer flag
+fn is_checking_signer(instructions: &[SbfInstruction]) -> bool {
+    for window in instructions.windows(3) {
+        if window[0].is_load() && window[0].mem_size() == Some(1) {
+            // This might be loading the is_signer flag
+            // Check if it's followed by a comparison
+            if window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
+/// Check if the instructions are checking the is_writable flag
+fn is_checking_writable(instructions: &[SbfInstruction]) -> bool {
+    for window in instructions.windows(3) {
+        if window[0].is_load() && window[0].mem_size() == Some(1) {
+            // This might be loading the is_writable flag
+            // Check if it's followed by a comparison
+            if window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM {
+                return true;
+            }
+        }
+    }
+    
+    false
+}
+
+/// Extract error codes from instructions and strings
+fn extract_error_codes(instructions: &[SbfInstruction], strings: &[String]) -> HashMap<u32, String> {
+    let mut error_codes = HashMap::new();
+    
+    // Look for error code patterns in strings
+    for s in strings {
+        // Check if this string looks like an error message
+        if s.contains("Error") || s.contains("Failed") || s.contains("Invalid") {
+            // Try to find a nearby error code
+            for window in instructions.windows(2) {
+                if window[0].opcode == opcodes::MOV_IMM && window[1].is_call() {
+                    // This might be setting an error code before calling sol_panic
+                    if window[1].imm as u32 == syscalls::SOL_PANIC {
+                        let error_code = window[0].imm as u32;
+                        error_codes.insert(error_code, s.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Add common Anchor error codes
+    if strings.iter().any(|s| s.contains("Anchor")) {
+        error_codes.insert(2000, "ConstraintMut".to_string());
+        error_codes.insert(2002, "ConstraintSigner".to_string());
+        error_codes.insert(2005, "ConstraintRentExempt".to_string());
+        error_codes.insert(2006, "ConstraintSeeds".to_string());
+        error_codes.insert(3001, "AccountDiscriminatorNotFound".to_string());
+        error_codes.insert(3005, "AccountNotEnoughKeys".to_string());
+        error_codes.insert(3010, "AccountNotSigner".to_string());
+    }
+    
+    error_codes
+}
+
+/// Convert instruction handlers to IDL instructions
+fn convert_to_idl_instructions(handlers: &[InstructionHandler], is_anchor: bool) -> Vec<Instruction> {
+    let mut instructions = Vec::new();
+    
+    for handler in handlers {
+        let mut instruction = Instruction::new(handler.name.clone(), handler.discriminator.unwrap_or(0));
+        
+        // Add discriminator for Anchor programs
+        if is_anchor {
+            instruction.discriminator = handler.anchor_discriminator;
+        }
+        
+        // Add parameters
+        for (i, param_type) in handler.parameters.iter().enumerate() {
+            instruction.add_arg(format!("arg_{}", i), param_type.clone());
+        }
+        
+        // Add accounts
+        for (name, is_signer, is_writable) in &handler.accounts {
+            instruction.add_account(name.clone(), *is_signer, *is_writable, false);
+        }
+        
+        instructions.push(instruction);
+    }
+    
+    instructions
+}
+
+/// Extract account structures from instructions and strings
+fn extract_account_structures(
+    instructions: &[SbfInstruction], 
+    strings: &[String],
+    is_anchor: bool
+) -> Vec<Account> {
+    let mut accounts = Vec::new();
+    
+    // Look for account structure patterns in strings
+    let account_names: Vec<_> = strings.iter()
+        .filter(|s| {
+            s.contains("Account") || s.contains("State") || 
+            s.contains("Config") || s.contains("Data")
+        })
+        .cloned()
+        .collect();
+    
+    for name in account_names {
+        let mut account = Account::new(name.clone(), "account".to_string());
+        
+        // Add fields based on common patterns
+        if name.to_lowercase().contains("mint") {
+            account.add_field("mint_authority".to_string(), "pubkey".to_string(), 0);
+            account.add_field("supply".to_string(), "u64".to_string(), 32);
+            account.add_field("decimals".to_string(), "u8".to_string(), 40);
+        } else if name.to_lowercase().contains("token") {
+            account.add_field("mint".to_string(), "pubkey".to_string(), 0);
+            account.add_field("owner".to_string(), "pubkey".to_string(), 32);
+            account.add_field("amount".to_string(), "u64".to_string(), 64);
+        } else {
+            // Generic account fields
+            account.add_field("owner".to_string(), "pubkey".to_string(), 0);
+            account.add_field("data".to_string(), "bytes".to_string(), 32);
+        }
+        
+        accounts.push(account);
+    }
+    
+    // If we couldn't find any accounts, add a generic one
+    if accounts.is_empty() {
+        let mut account = Account::new("State".to_string(), "state".to_string());
+        account.add_field("data".to_string(), "bytes".to_string(), 0);
+        accounts.push(account);
+    }
+    
+    accounts
+}
+
+/// Create a minimal analysis when we can't analyze the program
+fn create_minimal_analysis() -> Result<BytecodeAnalysis> {
+    info!("Creating minimal bytecode analysis");
     
     // Create a generic instruction
     let mut instruction = Instruction::new("process".to_string(), 0);
@@ -1091,5 +1063,511 @@ fn create_minimal_idl() -> Result<BytecodeAnalysis> {
     Ok(BytecodeAnalysis {
         instructions: vec![instruction],
         accounts: vec![account],
+        is_anchor: false,
+        error_codes: HashMap::new(),
     })
-} 
+}
+
+/// Find instruction dispatch points in the code
+fn find_instruction_dispatch(text_section: &[u8]) -> Vec<(usize, u8)> {
+    let mut dispatch_points = Vec::new();
+    
+    // Parse instructions
+    let instructions = match parse_instructions(text_section, 0) {
+        Ok(insns) => insns,
+        Err(_) => return dispatch_points,
+    };
+    
+    // Look for instruction dispatch patterns
+    for (i, window) in instructions.windows(3).enumerate() {
+        // Look for a pattern like:
+        // ldxb r0, [r1+0]   // Load discriminator byte
+        // jeq r0, <imm>, +12 // Compare and jump if equal
+        
+        if window[0].is_load() && 
+           window[0].mem_size() == Some(1) && 
+           window[0].dst_reg == 0 && 
+           (window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM) {
+            
+            let discriminator = window[1].imm as u8;
+            let offset = i;
+            
+            dispatch_points.push((offset, discriminator));
+        }
+    }
+    
+    dispatch_points
+}
+
+/// Find byte comparisons in the code
+fn find_byte_comparisons(code: &[u8]) -> Vec<(usize, u8)> {
+    let mut comparisons = Vec::new();
+    
+    // Parse instructions
+    let instructions = match parse_instructions(code, 0) {
+        Ok(insns) => insns,
+        Err(_) => return comparisons,
+    };
+    
+    // Look for byte comparison patterns
+    for (i, window) in instructions.windows(2).enumerate() {
+        // Look for a pattern like:
+        // jeq r0, <imm>, +12 // Compare and jump if equal
+        
+        if (window[0].opcode == opcodes::JEQ_IMM || window[0].opcode == opcodes::JNE_IMM) {
+            let value = window[0].imm as u8;
+            let offset = i;
+            
+            comparisons.push((offset, value));
+        }
+    }
+    
+    comparisons
+}
+
+/// Find pattern in binary data
+fn find_pattern(data: &[u8], pattern: &[u8]) -> bool {
+    data.windows(pattern.len()).any(|window| window == pattern)
+}
+
+/// Extract discriminator from instruction data
+pub fn extract_discriminator(data: &[u8]) -> u8 {
+    if data.is_empty() {
+        return 0;
+    }
+    
+    data[0]
+}
+
+/// Add this function for the tests
+pub fn infer_parameter_types(data: &[u8]) -> Vec<String> {
+    // Implementation based on data size and patterns
+    if data.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut types = Vec::new();
+    
+    // Check data length to infer types
+    match data.len() {
+        1 => types.push("u8".to_string()),
+        2 => types.push("u16".to_string()),
+        4 => types.push("u32".to_string()),
+        8 => types.push("u64".to_string()),
+        32 => types.push("pubkey".to_string()),
+        _ => {
+            // Try to break down into multiple types
+            let mut offset = 0;
+            while offset < data.len() {
+                let remaining = data.len() - offset;
+                if remaining >= 32 {
+                    types.push("pubkey".to_string());
+                    offset += 32;
+                } else if remaining >= 8 {
+                    types.push("u64".to_string());
+                    offset += 8;
+                } else if remaining >= 4 {
+                    types.push("u32".to_string());
+                    offset += 4;
+                } else if remaining >= 2 {
+                    types.push("u16".to_string());
+                    offset += 2;
+                } else {
+                    types.push("u8".to_string());
+                    offset += 1;
+                }
+            }
+        }
+    }
+    
+    types
+}
+
+/// Represents a relocation entry in an ELF file
+#[derive(Debug, Clone)]
+pub struct RelocationEntry {
+    pub offset: u64,      // Location to apply the relocation
+    pub symbol_index: u32, // Symbol table index
+    pub r_type: u32,      // Relocation type
+    pub addend: i64,      // Optional addend (for RELA type)
+}
+
+/// Represents a symbol from the ELF symbol table
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub binding: SymbolBinding,
+    pub symbol_type: SymbolType,
+    pub section_index: u16,
+}
+
+/// Symbol binding (local, global, weak)
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolBinding {
+    Local,
+    Global,
+    Weak,
+    Unknown(u8),
+}
+
+/// Symbol type (object, function, section, etc.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolType {
+    NoType,
+    Object,
+    Function,
+    Section,
+    File,
+    Common,
+    TLS,
+    Unknown(u8),
+}
+
+/// Represents a dynamic entry in the ELF file
+#[derive(Debug, Clone)]
+pub struct DynamicEntry {
+    pub tag: DynamicTag,
+    pub value: u64,
+}
+
+/// Dynamic entry tag types
+#[derive(Debug, Clone, PartialEq)]
+pub enum DynamicTag {
+    Null,
+    Needed,
+    PltRelSize,
+    Hash,
+    StrTab,
+    SymTab,
+    Rela,
+    RelaSize,
+    RelaEnt,
+    StrSize,
+    SymEnt,
+    Init,
+    Fini,
+    SoName,
+    RPath,
+    Symbolic,
+    Rel,
+    RelSize,
+    RelEnt,
+    PltRel,
+    Debug,
+    TextRel,
+    JmpRel,
+    BindNow,
+    InitArray,
+    FiniArray,
+    InitArraySize,
+    FiniArraySize,
+    RunPath,
+    Flags,
+    Other(u64),
+}
+
+/// Errors that can occur during ELF analysis
+#[derive(Debug, thiserror::Error)]
+pub enum ElfError {
+    #[error("Failed to open ELF file: {0}")]
+    OpenError(String),
+    
+    #[error("Invalid ELF file: {0}")]
+    InvalidElf(String),
+    
+    #[error("Invalid section: {0}")]
+    InvalidSection(String),
+    
+    #[error("Invalid symbol: {0}")]
+    InvalidSymbol(String),
+    
+    #[error("Invalid relocation: {0}")]
+    InvalidRelocation(String),
+    
+    #[error("Invalid dynamic entry: {0}")]
+    InvalidDynamic(String),
+    
+    #[error("Unsupported ELF format: {0}")]
+    UnsupportedFormat(String),
+    
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+/// Add this struct to store section information
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+    pub offset: u64,
+    pub section_type: u32,
+    pub flags: u64,
+}
+
+/// Add this struct to store ELF analysis results
+#[derive(Debug)]
+pub struct ElfAnalysisResult {
+    pub sections: Vec<SectionInfo>,
+    pub symbols: Vec<Symbol>,
+    pub functions: Vec<Symbol>,
+    pub relocations: HashMap<String, Vec<RelocationEntry>>,
+    pub dynamic_entries: Vec<DynamicEntry>,
+    pub dependencies: Vec<String>,
+}
+
+/// Add this struct for the ElfAnalyzer
+pub struct ElfAnalyzer<'a> {
+    elf_file: Elf<'a>,
+    data: &'a [u8],
+}
+
+impl<'a> ElfAnalyzer<'a> {
+    /// Create a new ELF analyzer from a file path
+    pub fn from_path(path: &str) -> Result<ElfAnalyzer<'static>, ElfError> {
+        let file_data = std::fs::read(path)
+            .map_err(|e| ElfError::OpenError(format!("Failed to read file: {}", e)))?;
+        
+        let owned_data = file_data.into_boxed_slice();
+        let leaked_data = Box::leak(owned_data);
+        
+        Self::from_bytes(leaked_data)
+    }
+    
+    /// Create a new ELF analyzer from bytes
+    pub fn from_bytes(data: &'a [u8]) -> Result<ElfAnalyzer<'a>, ElfError> {
+        // Validate ELF magic number
+        if data.len() < 4 || data[0] != 0x7F || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' {
+            return Err(ElfError::InvalidElf("Not a valid ELF file (invalid magic number)".to_string()));
+        }
+        
+        let elf_file = Elf::parse(data).map_err(|e| ElfError::InvalidElf(format!("Failed to parse ELF file: {}", e)))?;
+        
+        // Validate architecture
+        let arch = match elf_file.header.e_machine {
+            elf::header::EM_BPF => "BPF",
+            elf::header::EM_X86_64 => "x86_64",
+            elf::header::EM_AARCH64 => "AArch64",
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported architecture: {}", other))),
+        };
+        
+        // Validate ELF class (32-bit or 64-bit)
+        let class = match elf_file.header.e_ident[elf::abi::EI_CLASS] {
+            elf::abi::ELFCLASS32 => "32-bit",
+            elf::abi::ELFCLASS64 => "64-bit",
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported ELF class: {}", other))),
+        };
+        
+        // Validate ELF data encoding
+        let encoding = match elf_file.header.e_ident[elf::abi::EI_DATA] {
+            elf::abi::ELFDATA2LSB => "little-endian",
+            elf::abi::ELFDATA2MSB => "big-endian",
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported data encoding: {}", other))),
+        };
+        
+        Ok(ElfAnalyzer {
+            elf_file,
+            data,
+        })
+    }
+    
+    /// Parse the symbol table and extract function names and addresses
+    pub fn parse_symbols(&self) -> Result<Vec<Symbol>, ElfError> {
+        let mut symbols = Vec::new();
+        
+        // Find the symbol table section
+        let symtab_section = self.elf_file.section_headers.iter()
+            .find(|&section| section.sh_type == goblin::elf::section_header::SHT_SYMTAB);
+        
+        if let Some(symtab) = symtab_section {
+            // Use goblin's built-in symbol table parsing
+            for sym in self.elf_file.syms.iter() {
+                let name = self.elf_file.strtab.get_at(sym.st_name)
+                    .unwrap_or_default()
+                    .to_string();
+                
+                // Extract binding and type from st_info
+                let binding = match (sym.st_info >> 4) & 0xf {
+                    0 => SymbolBinding::Local,
+                    1 => SymbolBinding::Global,
+                    2 => SymbolBinding::Weak,
+                    other => SymbolBinding::Unknown(other),
+                };
+                
+                let symbol_type = match sym.st_info & 0xf {
+                    0 => SymbolType::NoType,
+                    1 => SymbolType::Object,
+                    2 => SymbolType::Function,
+                    3 => SymbolType::Section,
+                    4 => SymbolType::File,
+                    5 => SymbolType::Common,
+                    6 => SymbolType::TLS,
+                    other => SymbolType::Unknown(other),
+                };
+                
+                symbols.push(Symbol {
+                    name,
+                    address: sym.st_value,
+                    size: sym.st_size,
+                    binding,
+                    symbol_type,
+                    section_index: sym.st_shndx,
+                });
+            }
+        }
+        
+        Ok(symbols)
+    }
+    
+    /// Get all functions from the symbol table
+    pub fn get_functions(&self) -> Result<Vec<Symbol>, ElfError> {
+        let symbols = self.parse_symbols()?;
+        Ok(symbols.into_iter()
+            .filter(|sym| sym.symbol_type == SymbolType::Function)
+            .collect())
+    }
+    
+    /// Parse relocation sections (.rel and .rela)
+    pub fn parse_relocations(&self) -> Result<HashMap<String, Vec<RelocationEntry>>, ElfError> {
+        let mut relocations = HashMap::new();
+        
+        // Use goblin's built-in relocation parsing
+        for (section_name, rel_entries) in &self.elf_file.shdr_relocs {
+            let mut entries = Vec::new();
+            
+            for rel in rel_entries {
+                entries.push(RelocationEntry {
+                    offset: rel.r_offset,
+                    symbol_index: rel.r_sym,
+                    r_type: rel.r_type,
+                    addend: rel.r_addend.unwrap_or(0),
+                });
+            }
+            
+            relocations.insert(section_name.clone(), entries);
+        }
+        
+        Ok(relocations)
+    }
+    
+    /// Parse the dynamic section
+    pub fn parse_dynamic_section(&self) -> Result<Vec<DynamicEntry>, ElfError> {
+        let mut dynamic_entries = Vec::new();
+        
+        // Use goblin's built-in dynamic section parsing
+        for dyn_entry in &self.elf_file.dynamic {
+            if let Some(dyn_entry) = dyn_entry {
+                // Map tag to enum
+                let tag = match dyn_entry.d_tag {
+                    0 => DynamicTag::Null,
+                    1 => DynamicTag::Needed,
+                    2 => DynamicTag::PltRelSize,
+                    4 => DynamicTag::Hash,
+                    5 => DynamicTag::StrTab,
+                    6 => DynamicTag::SymTab,
+                    7 => DynamicTag::Rela,
+                    8 => DynamicTag::RelaSize,
+                    9 => DynamicTag::RelaEnt,
+                    10 => DynamicTag::StrSize,
+                    11 => DynamicTag::SymEnt,
+                    12 => DynamicTag::Init,
+                    13 => DynamicTag::Fini,
+                    14 => DynamicTag::SoName,
+                    15 => DynamicTag::RPath,
+                    16 => DynamicTag::Symbolic,
+                    17 => DynamicTag::Rel,
+                    18 => DynamicTag::RelSize,
+                    19 => DynamicTag::RelEnt,
+                    20 => DynamicTag::PltRel,
+                    21 => DynamicTag::Debug,
+                    22 => DynamicTag::TextRel,
+                    23 => DynamicTag::JmpRel,
+                    24 => DynamicTag::BindNow,
+                    25 => DynamicTag::InitArray,
+                    26 => DynamicTag::FiniArray,
+                    27 => DynamicTag::InitArraySize,
+                    28 => DynamicTag::FiniArraySize,
+                    29 => DynamicTag::RunPath,
+                    30 => DynamicTag::Flags,
+                    _ => DynamicTag::Other(dyn_entry.d_tag),
+                };
+                
+                dynamic_entries.push(DynamicEntry {
+                    tag,
+                    value: dyn_entry.d_val,
+                });
+                
+                // Stop at the end of the dynamic section (DT_NULL)
+                if tag == DynamicTag::Null {
+                    break;
+                }
+            }
+        }
+        
+        Ok(dynamic_entries)
+    }
+    
+    /// Get shared library dependencies
+    pub fn get_dependencies(&self) -> Result<Vec<String>, ElfError> {
+        let mut dependencies = Vec::new();
+        
+        // Use goblin's built-in library parsing
+        for lib in &self.elf_file.libraries {
+            dependencies.push(lib.to_string());
+        }
+        
+        Ok(dependencies)
+    }
+    
+    /// Parse all sections in the ELF file
+    pub fn parse_sections(&self) -> Result<Vec<SectionInfo>, ElfError> {
+        let mut sections = Vec::new();
+        
+        for (i, section_header) in self.elf_file.section_headers.iter().enumerate() {
+            let name = self.elf_file.shdr_strtab.get_at(section_header.sh_name)
+                .unwrap_or_default()
+                .to_string();
+            
+            sections.push(SectionInfo {
+                name,
+                address: section_header.sh_addr,
+                size: section_header.sh_size,
+                offset: section_header.sh_offset,
+                section_type: section_header.sh_type,
+                flags: section_header.sh_flags,
+            });
+        }
+        
+        Ok(sections)
+    }
+    
+    /// Perform a comprehensive analysis of the ELF file
+    pub fn analyze(&self) -> Result<ElfAnalysisResult, ElfError> {
+        // Validate the ELF file first
+        self.validate()?;
+        
+        // Parse all relevant sections
+        let sections = self.parse_sections()?;
+        let symbols = self.parse_symbols()?;
+        let relocations = self.parse_relocations()?;
+        let dynamic_entries = self.parse_dynamic_section()?;
+        let dependencies = self.get_dependencies().unwrap_or_default();
+        
+        // Extract functions
+        let functions = symbols.iter()
+            .filter(|sym| sym.symbol_type == SymbolType::Function)
+            .cloned()
+            .collect();
+        
+        Ok(ElfAnalysisResult {
+            sections,
+            symbols,
+            functions,
+            relocations,
+            dynamic_entries,
+            dependencies,
+        })
+    }
+}
