@@ -1,24 +1,23 @@
 //! Analyzer module for Solana programs
 
 pub mod bytecode;
-// pub mod patterns;  // Comment out the original patterns module
-pub mod patterns_simplified;  // Import the simplified module
-pub use patterns_simplified as patterns;  // Re-export it as patterns
+pub mod anchor;
+pub mod patterns;
+
 #[cfg(test)]
 mod tests;
-pub mod anchor;
-pub mod known_programs;  // Add this line to create the module
 
 use anyhow::Result;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use solana_client::rpc_client::RpcClient;
 use log::{info, warn};
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 
+// Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
-pub use self::patterns_simplified::PatternAnalysis;
+pub use self::patterns::PatternAnalysis;
 
 /// Analyzer for Solana programs
 pub struct Analyzer {

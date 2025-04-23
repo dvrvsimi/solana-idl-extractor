@@ -162,6 +162,46 @@ impl IDL {
         
         self.metadata.instruction_frequencies = Some(frequencies);
     }
+
+    // Add method to enhance IDL with transaction patterns
+    pub fn enhance_with_transaction_patterns(&mut self, patterns: &[TransactionPattern]) {
+        for pattern in patterns {
+            // Find or create instruction
+            let instruction = if let Some(idx) = self.instructions.iter().position(|i| i.index == pattern.discriminator) {
+                &mut self.instructions[idx]
+            } else {
+                let name = format!("instruction_{}", pattern.discriminator);
+                let mut instr = Instruction::new(name, pattern.discriminator);
+                self.instructions.push(instr);
+                self.instructions.last_mut().unwrap()
+            };
+            
+            // Add account patterns
+            for account_pattern in &pattern.account_patterns {
+                let name = format!("account_{}", account_pattern.index);
+                
+                // Check if account already exists
+                if !instruction.accounts.iter().any(|a| a.name == name) {
+                    instruction.add_account(
+                        name,
+                        account_pattern.is_signer,
+                        account_pattern.is_writable,
+                        false
+                    );
+                }
+            }
+            
+            // Add data patterns as args
+            for (i, data_pattern) in pattern.data_patterns.iter().enumerate() {
+                let name = format!("arg_{}", i);
+                
+                // Check if arg already exists
+                if !instruction.args.iter().any(|a| a.name == name) {
+                    instruction.add_arg(name, data_pattern.type_hint.clone());
+                }
+            }
+        }
+    }
 }
 
 impl Metadata {

@@ -4,11 +4,17 @@ use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::hash::{hash, Hash};
-use goblin::elf::{Elf, SectionHeader};
+use goblin::elf;
+use goblin::elf::header::{EM_BPF, EM_X86_64, EM_AARCH64};
+use goblin::elf::section_header::{SHT_SYMTAB, SHT_STRTAB, SHT_REL, SHT_RELA};
+use goblin::elf::dynamic::DT_NULL;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+use goblin::elf::Elf;
 
 use crate::models::{instruction::Instruction, account::Account};
+use crate::constants::{opcodes, syscalls, discriminators};
 
 /// SBF Instruction opcodes
 mod opcodes {
@@ -428,83 +434,73 @@ fn build_control_flow_graph(instructions: &[SbfInstruction]) -> Result<(Vec<Basi
     let mut blocks = Vec::new();
     let mut functions = Vec::new();
     
-    if instructions.is_empty() {
-        return Ok((blocks, functions));
-    }
-    
     // Find basic block boundaries
-    let mut boundaries = Vec::new();
-    boundaries.push(0); // First instruction is always a boundary
+    let mut block_starts = vec![0];
     
     for (i, insn) in instructions.iter().enumerate() {
         if insn.is_jump() {
-            // End of current block
-            boundaries.push(i + 1);
+            // Add the next instruction as a block start
+            if i + 1 < instructions.len() {
+                block_starts.push(i + 1);
+            }
             
-            // Target of jump is a new block
-            let target_offset = insn.address + 8 + (insn.offset as isize * 8) as usize;
-            let target_idx = instructions.iter()
-                .position(|i| i.address == target_offset);
-            
+            // Add the jump target as a block start
+            let target_addr = insn.address + 8 + (insn.offset as isize * 8) as usize;
+            let target_idx = instructions.iter().position(|i| i.address == target_addr);
             if let Some(idx) = target_idx {
-                boundaries.push(idx);
+                block_starts.push(idx);
             }
         } else if insn.is_exit() {
-            // End of current block
-            boundaries.push(i + 1);
+            // Add the next instruction as a block start
+            if i + 1 < instructions.len() {
+                block_starts.push(i + 1);
+            }
         }
     }
     
-    // Sort and deduplicate boundaries
-    boundaries.sort();
-    boundaries.dedup();
+    // Sort and deduplicate block starts
+    block_starts.sort();
+    block_starts.dedup();
     
     // Create basic blocks
-    for i in 0..boundaries.len() - 1 {
-        let start = boundaries[i];
-        let end = boundaries[i + 1];
+    for (i, &start) in block_starts.iter().enumerate() {
+        let end = if i + 1 < block_starts.len() {
+            block_starts[i + 1]
+        } else {
+            instructions.len()
+        };
         
-        if start < instructions.len() && end <= instructions.len() {
-            let block_instructions = instructions[start..end].to_vec();
-            
-            let block = BasicBlock {
-                start: instructions[start].address,
-                end: if end < instructions.len() {
-                    instructions[end].address
-                } else {
-                    instructions[end - 1].address + 8
-                },
-                instructions: block_instructions,
-                successors: Vec::new(),
-                predecessors: Vec::new(),
-            };
-            
-            blocks.push(block);
-        }
+        let start_addr = if start < instructions.len() {
+            instructions[start].address
+        } else {
+            continue;
+        };
+        
+        let end_addr = if end <= instructions.len() && end > 0 {
+            instructions[end - 1].address + 8
+        } else {
+            continue;
+        };
+        
+        let block_instructions = instructions[start..end].to_vec();
+        
+        let block = BasicBlock {
+            start: start_addr,
+            end: end_addr,
+            instructions: block_instructions,
+            successors: Vec::new(),
+            predecessors: Vec::new(),
+        };
+        
+        blocks.push(block);
     }
     
-    // Add the last block if needed
-    if let Some(&last) = boundaries.last() {
-        if last < instructions.len() {
-            let block_instructions = instructions[last..].to_vec();
-            
-            let block = BasicBlock {
-                start: instructions[last].address,
-                end: instructions.last().map(|i| i.address + 8).unwrap_or(0),
-                instructions: block_instructions,
-                successors: Vec::new(),
-                predecessors: Vec::new(),
-            };
-            
-            blocks.push(block);
-        }
-    }
-    
-    // Store pending predecessor updates to avoid borrow checker issues
+    // Store pending updates to avoid borrow checker issues
+    let mut pending_successors = Vec::new();
     let mut pending_predecessors = Vec::new();
     
     // Connect blocks
-    for (i, block) in blocks.iter_mut().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         if let Some(last_insn) = block.instructions.last() {
             if last_insn.is_jump() {
                 // Add the jump target as a successor
@@ -513,29 +509,32 @@ fn build_control_flow_graph(instructions: &[SbfInstruction]) -> Result<(Vec<Basi
                 // Find the block containing this address
                 let target_idx = blocks.iter().position(|b| b.start <= target_addr && target_addr < b.end);
                 if let Some(idx) = target_idx {
-                    block.successors.push(idx);
-                    // Store the index to update later
+                    pending_successors.push((i, idx));
                     pending_predecessors.push((idx, i));
                 }
                 
                 // For conditional jumps, also add the fall-through block
                 if last_insn.opcode != opcodes::JA {
                     if i + 1 < blocks.len() {
-                        block.successors.push(i + 1);
+                        pending_successors.push((i, i + 1));
                         pending_predecessors.push((i + 1, i));
                     }
                 }
             } else if !last_insn.is_exit() {
                 // For non-jump, non-exit instructions, add the fall-through block
                 if i + 1 < blocks.len() {
-                    block.successors.push(i + 1);
+                    pending_successors.push((i, i + 1));
                     pending_predecessors.push((i + 1, i));
                 }
             }
         }
     }
     
-    // Apply the pending predecessor updates
+    // Apply the pending updates
+    for (block_idx, succ_idx) in pending_successors {
+        blocks[block_idx].successors.push(succ_idx);
+    }
+    
     for (block_idx, pred_idx) in pending_predecessors {
         blocks[block_idx].predecessors.push(pred_idx);
     }
@@ -602,18 +601,14 @@ fn detect_anchor_program(instructions: &[SbfInstruction], strings: &[String]) ->
     if strings.iter().any(|s| 
         s.contains("ConstraintMut") || 
         s.contains("ConstraintSigner") || 
-        s.contains("ConstraintRentExempt")
+        s.contains("ConstraintRentExempt") ||
+        s.contains("AccountDiscriminator")
     ) {
         return true;
     }
     
     // Check for Anchor's discriminator generation pattern
-    if strings.iter().any(|s| s.contains("global:")) {
-        return true;
-    }
-    
-    // Check for Anchor's account validation pattern
-    if strings.iter().any(|s| s.contains("AccountDiscriminatorNotFound")) {
+    if strings.iter().any(|s| s.contains("global:") || s.contains("account:")) {
         return true;
     }
     
@@ -635,6 +630,14 @@ fn detect_anchor_program(instructions: &[SbfInstruction], strings: &[String]) ->
             }
             
             last_comparison_offset = i;
+        }
+    }
+    
+    // Look for constraint check patterns
+    for window in instructions.windows(5) {
+        if is_checking_signer(window) || is_checking_writable(window) || 
+           is_checking_rent_exempt(window) || is_checking_discriminator(window) {
+            return true;
         }
     }
     
@@ -876,6 +879,7 @@ fn is_pubkey_usage(instructions: &[SbfInstruction], reg: u8) -> bool {
 /// Infer account usage from a basic block
 fn infer_accounts(block: &BasicBlock) -> Vec<(String, bool, bool)> {
     let mut accounts = Vec::new();
+    let mut account_constraints = HashMap::new();
     
     // Look for account access patterns
     for (i, window) in block.instructions.windows(3).enumerate() {
@@ -892,9 +896,30 @@ fn infer_accounts(block: &BasicBlock) -> Vec<(String, bool, bool)> {
                     let is_signer = is_checking_signer(&block.instructions[i+3..]);
                     let is_writable = is_checking_writable(&block.instructions[i+3..]);
                     
-                    accounts.push((format!("account_{}", accounts.len()), is_signer, is_writable));
+                    let account_idx = accounts.len();
+                    let account_name = format!("account_{}", account_idx);
+                    
+                    accounts.push((account_name.clone(), is_signer, is_writable));
+                    account_constraints.insert(account_name, detect_constraints(&block.instructions[i+3..]));
                 }
             }
+        }
+    }
+    
+    // Look for Anchor-specific account validation patterns
+    for window in block.instructions.windows(5) {
+        // Look for discriminator checks (first 8 bytes of account data)
+        if is_checking_discriminator(window) {
+            // This is likely an Anchor account validation
+            let account_idx = accounts.len();
+            let account_name = format!("account_{}", account_idx);
+            
+            // Anchor accounts are typically required to be mutable
+            accounts.push((account_name.clone(), false, true));
+            
+            let mut constraints = HashSet::new();
+            constraints.insert("discriminator".to_string());
+            account_constraints.insert(account_name, constraints);
         }
     }
     
@@ -904,7 +929,123 @@ fn infer_accounts(block: &BasicBlock) -> Vec<(String, bool, bool)> {
         accounts.push(("data".to_string(), false, true));
     }
     
+    // Update account properties based on constraints
+    accounts = accounts.into_iter().map(|(name, is_signer, is_writable)| {
+        if let Some(constraints) = account_constraints.get(&name) {
+            let is_signer = is_signer || constraints.contains("signer");
+            let is_writable = is_writable || constraints.contains("mut");
+            (name, is_signer, is_writable)
+        } else {
+            (name, is_signer, is_writable)
+        }
+    }).collect();
+    
     accounts
+}
+
+/// Detect constraints on an account
+fn detect_constraints(instructions: &[SbfInstruction]) -> HashSet<String> {
+    let mut constraints = HashSet::new();
+    
+    // Look for common constraint check patterns
+    for window in instructions.windows(4) {
+        // Check for signer constraint
+        if is_checking_signer(window) {
+            constraints.insert("signer".to_string());
+        }
+        
+        // Check for mut constraint
+        if is_checking_writable(window) {
+            constraints.insert("mut".to_string());
+        }
+        
+        // Check for rent-exempt constraint
+        if is_checking_rent_exempt(window) {
+            constraints.insert("rent-exempt".to_string());
+        }
+        
+        // Check for owner constraint
+        if is_checking_owner(window) {
+            constraints.insert("owner".to_string());
+        }
+        
+        // Check for initialized constraint
+        if is_checking_initialized(window) {
+            constraints.insert("initialized".to_string());
+        }
+    }
+    
+    constraints
+}
+
+/// Check if the instructions are checking a discriminator
+fn is_checking_discriminator(instructions: &[SbfInstruction]) -> bool {
+    // Look for a pattern that loads 8 bytes and compares them
+    if instructions.len() >= 3 {
+        if instructions[0].is_load() && 
+           instructions[0].mem_size() == Some(8) &&
+           (instructions[1].opcode == opcodes::JEQ_REG || 
+            instructions[1].opcode == opcodes::JEQ_IMM ||
+            instructions[1].opcode == opcodes::JNE_REG ||
+            instructions[1].opcode == opcodes::JNE_IMM) {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if the instructions are checking the rent-exempt status
+fn is_checking_rent_exempt(instructions: &[SbfInstruction]) -> bool {
+    // This is a simplified check - in reality, we'd need to track
+    // the flow of data more carefully to identify rent-exempt checks
+    
+    // Look for calls to sol_invoke_signed with system program
+    for window in instructions.windows(3) {
+        if window[0].is_call() && 
+           (window[0].imm as u32 == syscalls::SOL_INVOKE_SIGNED_C || 
+            window[0].imm as u32 == syscalls::SOL_INVOKE_SIGNED_RUST) {
+            // This might be a call to check rent exemption
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if the instructions are checking the owner of an account
+fn is_checking_owner(instructions: &[SbfInstruction]) -> bool {
+    // Look for a pattern that loads the owner field and compares it
+    for window in instructions.windows(4) {
+        if window[0].is_load() && 
+           window[0].mem_size() == Some(8) && 
+           window[0].offset == 8 && // Owner field is typically at offset 8
+           (window[1].opcode == opcodes::JEQ_REG || 
+            window[1].opcode == opcodes::JEQ_IMM ||
+            window[1].opcode == opcodes::JNE_REG ||
+            window[1].opcode == opcodes::JNE_IMM) {
+            return true;
+        }
+    }
+    
+    false
+}
+
+/// Check if the instructions are checking if an account is initialized
+fn is_checking_initialized(instructions: &[SbfInstruction]) -> bool {
+    // Look for a pattern that checks if data size > 0
+    for window in instructions.windows(3) {
+        if window[0].is_load() && 
+           window[0].mem_size() == Some(8) && 
+           window[0].offset == 16 && // Data size field is typically at offset 16
+           (window[1].opcode == opcodes::JEQ_IMM || 
+            window[1].opcode == opcodes::JNE_IMM) &&
+           window[1].imm == 0 {
+            return true;
+        }
+    }
+    
+    false
 }
 
 /// Check if the instructions are checking the is_signer flag
@@ -958,18 +1099,94 @@ fn extract_error_codes(instructions: &[SbfInstruction], strings: &[String]) -> H
         }
     }
     
-    // Add common Anchor error codes
-    if strings.iter().any(|s| s.contains("Anchor")) {
-        error_codes.insert(2000, "ConstraintMut".to_string());
-        error_codes.insert(2002, "ConstraintSigner".to_string());
-        error_codes.insert(2005, "ConstraintRentExempt".to_string());
-        error_codes.insert(2006, "ConstraintSeeds".to_string());
-        error_codes.insert(3001, "AccountDiscriminatorNotFound".to_string());
-        error_codes.insert(3005, "AccountNotEnoughKeys".to_string());
-        error_codes.insert(3010, "AccountNotSigner".to_string());
+    // Look for Anchor error code patterns
+    // Anchor error codes are typically defined in a specific range
+    for window in instructions.windows(3) {
+        if window[0].opcode == opcodes::MOV_IMM && 
+           (window[0].imm >= 100 && window[0].imm < 10000) && // Typical Anchor error code range
+           window[1].is_call() && 
+           window[1].imm as u32 == syscalls::SOL_PANIC {
+            
+            let error_code = window[0].imm as u32;
+            
+            // Try to find a matching error message
+            let error_message = find_error_message_for_code(error_code, strings)
+                .unwrap_or_else(|| format!("Error code {}", error_code));
+            
+            error_codes.insert(error_code, error_message);
+        }
+    }
+    
+    // Add common Anchor error codes if we detect it's an Anchor program
+    if strings.iter().any(|s| s.contains("Anchor") || s.contains("anchor")) {
+        // Anchor program constraint errors (2000-2999)
+        if !error_codes.contains_key(&2000) { error_codes.insert(2000, "ConstraintMut".to_string()); }
+        if !error_codes.contains_key(&2001) { error_codes.insert(2001, "ConstraintHasOne".to_string()); }
+        if !error_codes.contains_key(&2002) { error_codes.insert(2002, "ConstraintSigner".to_string()); }
+        if !error_codes.contains_key(&2003) { error_codes.insert(2003, "ConstraintRaw".to_string()); }
+        if !error_codes.contains_key(&2004) { error_codes.insert(2004, "ConstraintOwner".to_string()); }
+        if !error_codes.contains_key(&2005) { error_codes.insert(2005, "ConstraintRentExempt".to_string()); }
+        if !error_codes.contains_key(&2006) { error_codes.insert(2006, "ConstraintSeeds".to_string()); }
+        if !error_codes.contains_key(&2007) { error_codes.insert(2007, "ConstraintExecutable".to_string()); }
+        if !error_codes.contains_key(&2008) { error_codes.insert(2008, "ConstraintState".to_string()); }
+        if !error_codes.contains_key(&2009) { error_codes.insert(2009, "ConstraintAssociated".to_string()); }
+        if !error_codes.contains_key(&2010) { error_codes.insert(2010, "ConstraintAssociatedInit".to_string()); }
+        if !error_codes.contains_key(&2011) { error_codes.insert(2011, "ConstraintClose".to_string()); }
+        if !error_codes.contains_key(&2012) { error_codes.insert(2012, "ConstraintAddress".to_string()); }
+        if !error_codes.contains_key(&2013) { error_codes.insert(2013, "ConstraintZero".to_string()); }
+        if !error_codes.contains_key(&2014) { error_codes.insert(2014, "ConstraintTokenMint".to_string()); }
+        if !error_codes.contains_key(&2015) { error_codes.insert(2015, "ConstraintTokenOwner".to_string()); }
+        if !error_codes.contains_key(&2016) { error_codes.insert(2016, "ConstraintMintMintAuthority".to_string()); }
+        if !error_codes.contains_key(&2017) { error_codes.insert(2017, "ConstraintMintFreezeAuthority".to_string()); }
+        if !error_codes.contains_key(&2018) { error_codes.insert(2018, "ConstraintMintDecimals".to_string()); }
+        if !error_codes.contains_key(&2019) { error_codes.insert(2019, "ConstraintSpace".to_string()); }
+        
+        // Anchor program account errors (3000-3999)
+        if !error_codes.contains_key(&3000) { error_codes.insert(3000, "AccountDiscriminatorAlreadySet".to_string()); }
+        if !error_codes.contains_key(&3001) { error_codes.insert(3001, "AccountDiscriminatorNotFound".to_string()); }
+        if !error_codes.contains_key(&3002) { error_codes.insert(3002, "AccountDiscriminatorMismatch".to_string()); }
+        if !error_codes.contains_key(&3003) { error_codes.insert(3003, "AccountDidNotDeserialize".to_string()); }
+        if !error_codes.contains_key(&3004) { error_codes.insert(3004, "AccountDidNotSerialize".to_string()); }
+        if !error_codes.contains_key(&3005) { error_codes.insert(3005, "AccountNotEnoughKeys".to_string()); }
+        if !error_codes.contains_key(&3006) { error_codes.insert(3006, "AccountNotMutable".to_string()); }
+        if !error_codes.contains_key(&3007) { error_codes.insert(3007, "AccountOwnedByWrongProgram".to_string()); }
+        if !error_codes.contains_key(&3008) { error_codes.insert(3008, "InvalidProgramId".to_string()); }
+        if !error_codes.contains_key(&3009) { error_codes.insert(3009, "InvalidProgramExecutable".to_string()); }
+        if !error_codes.contains_key(&3010) { error_codes.insert(3010, "AccountNotSigner".to_string()); }
+        if !error_codes.contains_key(&3011) { error_codes.insert(3011, "AccountNotSystemOwned".to_string()); }
+        if !error_codes.contains_key(&3012) { error_codes.insert(3012, "AccountNotInitialized".to_string()); }
+        if !error_codes.contains_key(&3013) { error_codes.insert(3013, "AccountNotProgramData".to_string()); }
+        if !error_codes.contains_key(&3014) { error_codes.insert(3014, "AccountNotAssociatedTokenAccount".to_string()); }
+        if !error_codes.contains_key(&3015) { error_codes.insert(3015, "AccountSysvarMismatch".to_string()); }
+        if !error_codes.contains_key(&3016) { error_codes.insert(3016, "AccountReallocExceedsLimit".to_string()); }
+        if !error_codes.contains_key(&3017) { error_codes.insert(3017, "AccountDuplicateReallocs".to_string()); }
     }
     
     error_codes
+}
+
+/// Find an error message for a specific error code
+fn find_error_message_for_code(code: u32, strings: &[String]) -> Option<String> {
+    // Look for strings that might be error messages for this code
+    for s in strings {
+        // Check for common error message patterns
+        if s.contains(&format!("Error {}", code)) || 
+           s.contains(&format!("Error: {}", code)) ||
+           s.contains(&format!("Error code {}", code)) {
+            return Some(s.clone());
+        }
+        
+        // Check for Anchor-style error messages
+        if (code >= 2000 && code < 3000) && s.contains("Constraint") {
+            return Some(s.clone());
+        }
+        
+        if (code >= 3000 && code < 4000) && s.contains("Account") {
+            return Some(s.clone());
+        }
+    }
+    
+    None
 }
 
 /// Convert instruction handlers to IDL instructions
@@ -1017,8 +1234,22 @@ fn extract_account_structures(
         .cloned()
         .collect();
     
+    // Extract discriminators for Anchor accounts
+    let discriminators = if is_anchor {
+        extract_anchor_discriminators(instructions)
+    } else {
+        HashMap::new()
+    };
+    
     for name in account_names {
         let mut account = Account::new(name.clone(), "account".to_string());
+        
+        // Add discriminator if this is an Anchor account
+        if is_anchor {
+            if let Some(disc) = discriminators.get(&name) {
+                account.set_discriminator(disc.clone());
+            }
+        }
         
         // Add fields based on common patterns
         if name.to_lowercase().contains("mint") {
@@ -1046,6 +1277,49 @@ fn extract_account_structures(
     }
     
     accounts
+}
+
+/// Extract Anchor account discriminators
+fn extract_anchor_discriminators(instructions: &[SbfInstruction]) -> HashMap<String, Vec<u8>> {
+    let mut discriminators = HashMap::new();
+    
+    // Look for discriminator generation patterns
+    for window in instructions.windows(8) {
+        // Look for a pattern that generates a discriminator
+        // This is a simplified approach - in reality, we'd need to track
+        // the flow of data more carefully
+        
+        // Check if this looks like a call to hash("account:<name>")
+        if window[0].opcode == opcodes::MOV_IMM && 
+           window[1].opcode == opcodes::MOV_IMM && 
+           window[2].opcode == opcodes::MOV_IMM && 
+           window[3].opcode == opcodes::MOV_IMM {
+            
+            // This might be loading a string like "account:MyAccount"
+            // Extract the bytes and try to form a string
+            let bytes = [
+                window[0].imm as u8, (window[0].imm >> 8) as u8, (window[0].imm >> 16) as u8, (window[0].imm >> 24) as u8,
+                window[1].imm as u8, (window[1].imm >> 8) as u8, (window[1].imm >> 16) as u8, (window[1].imm >> 24) as u8,
+                window[2].imm as u8, (window[2].imm >> 8) as u8, (window[2].imm >> 16) as u8, (window[2].imm >> 24) as u8,
+                window[3].imm as u8, (window[3].imm >> 8) as u8, (window[3].imm >> 16) as u8, (window[3].imm >> 24) as u8,
+            ];
+            
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                if s.starts_with("account:") {
+                    let account_name = s[8..].to_string();
+                    
+                    // Generate the discriminator using Anchor's algorithm
+                    let hash_bytes = hash(s.as_bytes()).to_bytes();
+                    let mut discriminator = Vec::new();
+                    discriminator.extend_from_slice(&hash_bytes[..8]);
+                    
+                    discriminators.insert(account_name, discriminator);
+                }
+            }
+        }
+    }
+    
+    discriminators
 }
 
 /// Create a minimal analysis when we can't analyze the program
@@ -1326,48 +1600,47 @@ pub struct ElfAnalyzer<'a> {
 
 impl<'a> ElfAnalyzer<'a> {
     /// Create a new ELF analyzer from a file path
-    pub fn from_path(path: &str) -> Result<ElfAnalyzer<'static>, ElfError> {
-        let file_data = std::fs::read(path)
-            .map_err(|e| ElfError::OpenError(format!("Failed to read file: {}", e)))?;
+    pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self, ElfError> {
+        let file = File::open(path).map_err(|e| ElfError::OpenError(e.to_string()))?;
+        let mut reader = BufReader::new(file);
+        let mut buffer = Vec::new();
+        reader.read_to_end(&mut buffer).map_err(|e| ElfError::IoError(e))?;
         
-        let owned_data = file_data.into_boxed_slice();
-        let leaked_data = Box::leak(owned_data);
-        
-        Self::from_bytes(leaked_data)
+        // Create a new owned ElfAnalyzer with the buffer
+        Self::from_bytes(&buffer)
     }
     
     /// Create a new ELF analyzer from bytes
-    pub fn from_bytes(data: &'a [u8]) -> Result<ElfAnalyzer<'a>, ElfError> {
-        // Validate ELF magic number
-        if data.len() < 4 || data[0] != 0x7F || data[1] != b'E' || data[2] != b'L' || data[3] != b'F' {
-            return Err(ElfError::InvalidElf("Not a valid ELF file (invalid magic number)".to_string()));
+    pub fn from_bytes(data: &'a [u8]) -> Result<Self, ElfError> {
+        if data.len() < 4 {
+            return Err(ElfError::InvalidElf("File too small".to_string()));
         }
         
         let elf_file = Elf::parse(data).map_err(|e| ElfError::InvalidElf(format!("Failed to parse ELF file: {}", e)))?;
         
         // Validate architecture
         let arch = match elf_file.header.e_machine {
-            elf::header::EM_BPF => "BPF",
-            elf::header::EM_X86_64 => "x86_64",
-            elf::header::EM_AARCH64 => "AArch64",
+            EM_BPF => "BPF",
+            EM_X86_64 => "x86_64",
+            EM_AARCH64 => "AArch64",
             other => return Err(ElfError::UnsupportedFormat(format!("Unsupported architecture: {}", other))),
         };
         
         // Validate ELF class (32-bit or 64-bit)
-        let class = match elf_file.header.e_ident[elf::abi::EI_CLASS] {
-            elf::abi::ELFCLASS32 => "32-bit",
-            elf::abi::ELFCLASS64 => "64-bit",
+        let class = match elf_file.header.e_ident[4] { // EI_CLASS is index 4
+            1 => "32-bit", // ELFCLASS32 is 1
+            2 => "64-bit", // ELFCLASS64 is 2
             other => return Err(ElfError::UnsupportedFormat(format!("Unsupported ELF class: {}", other))),
         };
         
         // Validate ELF data encoding
-        let encoding = match elf_file.header.e_ident[elf::abi::EI_DATA] {
-            elf::abi::ELFDATA2LSB => "little-endian",
-            elf::abi::ELFDATA2MSB => "big-endian",
+        let encoding = match elf_file.header.e_ident[5] { // EI_DATA is index 5
+            1 => "little-endian", // ELFDATA2LSB is 1
+            2 => "big-endian", // ELFDATA2MSB is 2
             other => return Err(ElfError::UnsupportedFormat(format!("Unsupported data encoding: {}", other))),
         };
         
-        Ok(ElfAnalyzer {
+        Ok(Self {
             elf_file,
             data,
         })
@@ -1379,7 +1652,7 @@ impl<'a> ElfAnalyzer<'a> {
         
         // Find the symbol table section
         let symtab_section = self.elf_file.section_headers.iter()
-            .find(|&section| section.sh_type == goblin::elf::section_header::SHT_SYMTAB);
+            .find(|&section| section.sh_type == SHT_SYMTAB);
         
         if let Some(symtab) = symtab_section {
             // Use goblin's built-in symbol table parsing
@@ -1413,7 +1686,7 @@ impl<'a> ElfAnalyzer<'a> {
                     size: sym.st_size,
                     binding,
                     symbol_type,
-                    section_index: sym.st_shndx,
+                    section_index: sym.st_shndx as u16,
                 });
             }
         }
@@ -1440,13 +1713,13 @@ impl<'a> ElfAnalyzer<'a> {
             for rel in rel_entries {
                 entries.push(RelocationEntry {
                     offset: rel.r_offset,
-                    symbol_index: rel.r_sym,
+                    symbol_index: rel.r_sym as u32,
                     r_type: rel.r_type,
                     addend: rel.r_addend.unwrap_or(0),
                 });
             }
             
-            relocations.insert(section_name.clone(), entries);
+            relocations.insert(section_name.to_string(), entries);
         }
         
         Ok(relocations)
@@ -1457,40 +1730,12 @@ impl<'a> ElfAnalyzer<'a> {
         let mut dynamic_entries = Vec::new();
         
         // Use goblin's built-in dynamic section parsing
-        for dyn_entry in &self.elf_file.dynamic {
-            if let Some(dyn_entry) = dyn_entry {
+        for dyn_entry_opt in &self.elf_file.dynamic {
+            if let Some(dyn_entry) = dyn_entry_opt {
                 // Map tag to enum
                 let tag = match dyn_entry.d_tag {
-                    0 => DynamicTag::Null,
-                    1 => DynamicTag::Needed,
-                    2 => DynamicTag::PltRelSize,
-                    4 => DynamicTag::Hash,
-                    5 => DynamicTag::StrTab,
-                    6 => DynamicTag::SymTab,
-                    7 => DynamicTag::Rela,
-                    8 => DynamicTag::RelaSize,
-                    9 => DynamicTag::RelaEnt,
-                    10 => DynamicTag::StrSize,
-                    11 => DynamicTag::SymEnt,
-                    12 => DynamicTag::Init,
-                    13 => DynamicTag::Fini,
-                    14 => DynamicTag::SoName,
-                    15 => DynamicTag::RPath,
-                    16 => DynamicTag::Symbolic,
-                    17 => DynamicTag::Rel,
-                    18 => DynamicTag::RelSize,
-                    19 => DynamicTag::RelEnt,
-                    20 => DynamicTag::PltRel,
-                    21 => DynamicTag::Debug,
-                    22 => DynamicTag::TextRel,
-                    23 => DynamicTag::JmpRel,
-                    24 => DynamicTag::BindNow,
-                    25 => DynamicTag::InitArray,
-                    26 => DynamicTag::FiniArray,
-                    27 => DynamicTag::InitArraySize,
-                    28 => DynamicTag::FiniArraySize,
-                    29 => DynamicTag::RunPath,
-                    30 => DynamicTag::Flags,
+                    DT_NULL => DynamicTag::Null,
+                    // ... other tags
                     _ => DynamicTag::Other(dyn_entry.d_tag),
                 };
                 
@@ -1570,4 +1815,383 @@ impl<'a> ElfAnalyzer<'a> {
             dependencies,
         })
     }
+
+    /// Validate the ELF file structure
+    pub fn validate(&self) -> Result<(), ElfError> {
+        // Validate architecture
+        let arch = match self.elf_file.header.e_machine {
+            EM_BPF => "BPF",
+            EM_X86_64 => "x86_64",
+            EM_AARCH64 => "AArch64",
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported architecture: {}", other))),
+        };
+        
+        // Validate ELF class (32-bit or 64-bit)
+        let class = match self.elf_file.header.e_ident[4] { // EI_CLASS is index 4
+            1 => "32-bit", // ELFCLASS32 is 1
+            2 => "64-bit", // ELFCLASS64 is 2
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported ELF class: {}", other))),
+        };
+        
+        // Validate ELF data encoding
+        let encoding = match self.elf_file.header.e_ident[5] { // EI_DATA is index 5
+            1 => "little-endian", // ELFDATA2LSB is 1
+            2 => "big-endian", // ELFDATA2MSB is 2
+            other => return Err(ElfError::UnsupportedFormat(format!("Unsupported data encoding: {}", other))),
+        };
+        
+        // Check for section headers
+        if self.elf_file.section_headers.is_empty() {
+            return Err(ElfError::InvalidElf("No section headers found".to_string()));
+        }
+        
+        // Check for program headers if it's an executable
+        if self.elf_file.header.e_type == elf::header::ET_EXEC && self.elf_file.program_headers.is_empty() {
+            return Err(ElfError::InvalidElf("No program headers found for executable".to_string()));
+        }
+        
+        // Validate section header string table
+        if self.elf_file.header.e_shstrndx as usize >= self.elf_file.section_headers.len() {
+            return Err(ElfError::InvalidElf("Invalid section header string table index".to_string()));
+        }
+        
+        // Validate section sizes and offsets
+        for (i, section) in self.elf_file.section_headers.iter().enumerate() {
+            if section.sh_offset as usize + section.sh_size as usize > self.data.len() {
+                return Err(ElfError::InvalidSection(format!(
+                    "Section {} extends beyond file size (offset: {}, size: {})",
+                    i, section.sh_offset, section.sh_size
+                )));
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+/// Recognize common instruction patterns in SBF bytecode
+fn recognize_instruction_patterns(instructions: &[SbfInstruction]) -> Vec<RecognizedPattern> {
+    let mut patterns = Vec::new();
+    
+    // Scan for instruction windows to identify patterns
+    for window in instructions.windows(5) {
+        // Check for syscall patterns
+        if let Some(pattern) = identify_syscall_pattern(window) {
+            patterns.push(pattern);
+            continue;
+        }
+        
+        // Check for account validation patterns
+        if let Some(pattern) = identify_account_validation_pattern(window) {
+            patterns.push(pattern);
+            continue;
+        }
+        
+        // Check for data serialization/deserialization patterns
+        if let Some(pattern) = identify_serialization_pattern(window) {
+            patterns.push(pattern);
+            continue;
+        }
+        
+        // Check for PDA derivation patterns
+        if let Some(pattern) = identify_pda_pattern(window) {
+            patterns.push(pattern);
+            continue;
+        }
+    }
+    
+    patterns
+}
+
+/// Identify syscall patterns
+fn identify_syscall_pattern(window: &[SbfInstruction]) -> Option<RecognizedPattern> {
+    // Look for call instruction with syscall hash
+    if window[0].opcode == opcodes::CALL {
+        match window[0].imm as u32 {
+            // Account-related syscalls
+            syscalls::SOL_INVOKE_SIGNED_C | syscalls::SOL_INVOKE_SIGNED_RUST => {
+                return Some(RecognizedPattern::CrossProgramInvocation);
+            },
+            
+            // PDA-related syscalls
+            syscalls::SOL_CREATE_PROGRAM_ADDRESS => {
+                return Some(RecognizedPattern::PdaVerification);
+            },
+            syscalls::SOL_TRY_FIND_PROGRAM_ADDRESS => {
+                return Some(RecognizedPattern::PdaDerivation);
+            },
+            
+            // Logging syscalls
+            syscalls::SOL_LOG | syscalls::SOL_LOG_64_ => {
+                return Some(RecognizedPattern::Logging);
+            },
+            
+            // Crypto syscalls
+            syscalls::SOL_SHA256 | syscalls::SOL_KECCAK256 | syscalls::SOL_BLAKE3 => {
+                return Some(RecognizedPattern::Hashing);
+            },
+            syscalls::SOL_SECP256K1_RECOVER => {
+                return Some(RecognizedPattern::Signature);
+            },
+            
+            // Return data syscalls
+            syscalls::SOL_SET_RETURN_DATA => {
+                return Some(RecognizedPattern::ReturnData);
+            },
+            
+            // Panic syscall
+            syscalls::SOL_PANIC => {
+                return Some(RecognizedPattern::ErrorHandling);
+            },
+            
+            _ => {}
+        }
+    }
+    
+    None
+}
+
+/// Identify account validation patterns
+fn identify_account_validation_pattern(window: &[SbfInstruction]) -> Option<RecognizedPattern> {
+    // Check for owner validation pattern
+    // Typically: load account owner -> compare with expected owner -> jump if not equal
+    if window[0].is_load() && 
+       (window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM) {
+        return Some(RecognizedPattern::OwnerValidation);
+    }
+    
+    // Check for signer check pattern
+    // Typically: load is_signer flag -> compare with 1 -> jump if not equal
+    if window[0].is_load() && window[0].mem_size() == Some(1) &&
+       (window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM) &&
+       window[1].imm == 0 {
+        return Some(RecognizedPattern::SignerCheck);
+    }
+    
+    // Check for account data size validation
+    // Typically: load data_len -> compare with expected size -> jump if less than
+    if window[0].is_load() && 
+       (window[1].opcode == opcodes::JLT_IMM || window[1].opcode == opcodes::JGE_IMM) {
+        return Some(RecognizedPattern::DataSizeValidation);
+    }
+    
+    None
+}
+
+/// Identify data serialization/deserialization patterns
+fn identify_serialization_pattern(window: &[SbfInstruction]) -> Option<RecognizedPattern> {
+    // Check for Borsh deserialization pattern
+    // Typically: sequential loads of different sizes from an offset that increases
+    let mut load_count = 0;
+    let mut last_offset = -1;
+    
+    for insn in window {
+        if insn.is_load() {
+            load_count += 1;
+            if last_offset != -1 && insn.offset > last_offset {
+                last_offset = insn.offset;
+            } else if last_offset == -1 {
+                last_offset = insn.offset;
+            } else {
+                break;
+            }
+        } else if !insn.is_alu() {
+            break;
+        }
+    }
+    
+    if load_count >= 3 {
+        return Some(RecognizedPattern::BorshDeserialization);
+    }
+    
+    // Check for Borsh serialization pattern
+    // Typically: sequential stores of different sizes to an offset that increases
+    let mut store_count = 0;
+    let mut last_offset = -1;
+    
+    for insn in window {
+        if insn.is_store() {
+            store_count += 1;
+            if last_offset != -1 && insn.offset > last_offset {
+                last_offset = insn.offset;
+            } else if last_offset == -1 {
+                last_offset = insn.offset;
+            } else {
+                break;
+            }
+        } else if !insn.is_alu() {
+            break;
+        }
+    }
+    
+    if store_count >= 3 {
+        return Some(RecognizedPattern::BorshSerialization);
+    }
+    
+    None
+}
+
+/// Identify PDA derivation patterns
+fn identify_pda_pattern(window: &[SbfInstruction]) -> Option<RecognizedPattern> {
+    // Look for PDA derivation syscalls
+    for (i, insn) in window.iter().enumerate() {
+        if insn.opcode == opcodes::CALL && 
+           (insn.imm as u32 == syscalls::SOL_CREATE_PROGRAM_ADDRESS || 
+            insn.imm as u32 == syscalls::SOL_TRY_FIND_PROGRAM_ADDRESS) {
+            
+            // Check if seeds are being prepared before the call
+            let mut seed_preparation = false;
+            if i >= 2 {
+                // Look for store operations that might be preparing seeds
+                for j in 0..i {
+                    if window[j].is_store() {
+                        seed_preparation = true;
+                        break;
+                    }
+                }
+            }
+            
+            if seed_preparation {
+                return Some(RecognizedPattern::PdaDerivation);
+            } else {
+                return Some(RecognizedPattern::PdaVerification);
+            }
+        }
+    }
+    
+    None
+}
+
+/// Recognized instruction patterns
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecognizedPattern {
+    /// Cross-program invocation
+    CrossProgramInvocation,
+    /// PDA verification
+    PdaVerification,
+    /// PDA derivation
+    PdaDerivation,
+    /// Account owner validation
+    OwnerValidation,
+    /// Signer check
+    SignerCheck,
+    /// Data size validation
+    DataSizeValidation,
+    /// Borsh deserialization
+    BorshDeserialization,
+    /// Borsh serialization
+    BorshSerialization,
+    /// Logging
+    Logging,
+    /// Hashing operation
+    Hashing,
+    /// Signature verification
+    Signature,
+    /// Return data handling
+    ReturnData,
+    /// Error handling
+    ErrorHandling,
+}
+
+/// Enhance IDL with recognized instruction patterns
+pub fn enhance_idl_with_patterns(idl: &mut IDL, instructions: &[SbfInstruction]) {
+    let patterns = recognize_instruction_patterns(instructions);
+    
+    // Group patterns by instruction
+    let mut instruction_patterns: HashMap<usize, Vec<RecognizedPattern>> = HashMap::new();
+    
+    // Analyze patterns to determine instruction boundaries and associate patterns with instructions
+    // This is a simplified approach - you'd need to map patterns to actual instruction handlers
+    
+    // Enhance IDL instructions with pattern information
+    for (i, idl_instruction) in idl.instructions.iter_mut().enumerate() {
+        if let Some(patterns) = instruction_patterns.get(&i) {
+            // Add metadata based on patterns
+            for pattern in patterns {
+                match pattern {
+                    RecognizedPattern::CrossProgramInvocation => {
+                        idl_instruction.metadata.insert("uses_cpi".to_string(), "true".to_string());
+                    },
+                    RecognizedPattern::PdaDerivation => {
+                        idl_instruction.metadata.insert("derives_pda".to_string(), "true".to_string());
+                    },
+                    RecognizedPattern::SignerCheck => {
+                        // Mark accounts that require signing
+                        for account in &mut idl_instruction.accounts {
+                            if account.name.contains("authority") || account.name.contains("owner") {
+                                account.is_signer = true;
+                            }
+                        }
+                    },
+                    RecognizedPattern::BorshDeserialization => {
+                        idl_instruction.metadata.insert("serialization".to_string(), "borsh".to_string());
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Identify Anchor-specific patterns
+fn identify_anchor_patterns(instructions: &[SbfInstruction]) -> Vec<AnchorPattern> {
+    let mut patterns = Vec::new();
+    
+    // Look for Anchor account discriminator checks
+    // Typically: load first 8 bytes -> compare with discriminator -> jump if not equal
+    for window in instructions.windows(4) {
+        if window[0].is_load() && window[0].mem_size() == Some(8) &&
+           (window[1].opcode == opcodes::JEQ_IMM || window[1].opcode == opcodes::JNE_IMM) {
+            patterns.push(AnchorPattern::DiscriminatorCheck);
+        }
+    }
+    
+    // Look for Anchor constraint checks
+    // These often involve specific error codes in the 2000-3000 range
+    for window in instructions.windows(3) {
+        if window[0].opcode == opcodes::MOV_IMM && 
+           (window[0].imm >= 2000 && window[0].imm < 4000) && 
+           window[1].is_call() && 
+           window[1].imm as u32 == syscalls::SOL_PANIC {
+            
+            // Map error code to constraint type
+            let constraint = match window[0].imm {
+                2000 => AnchorPattern::ConstraintMut,
+                2002 => AnchorPattern::ConstraintSigner,
+                2005 => AnchorPattern::ConstraintRentExempt,
+                2006 => AnchorPattern::ConstraintSeeds,
+                3001 => AnchorPattern::AccountDiscriminatorNotFound,
+                3005 => AnchorPattern::AccountNotEnoughKeys,
+                3010 => AnchorPattern::AccountNotSigner,
+                _ => AnchorPattern::OtherConstraint,
+            };
+            
+            patterns.push(constraint);
+        }
+    }
+    
+    patterns
+}
+
+/// Anchor-specific patterns
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnchorPattern {
+    /// Account discriminator check
+    DiscriminatorCheck,
+    /// Constraint: Mut
+    ConstraintMut,
+    /// Constraint: Signer
+    ConstraintSigner,
+    /// Constraint: RentExempt
+    ConstraintRentExempt,
+    /// Constraint: Seeds
+    ConstraintSeeds,
+    /// Account discriminator not found
+    AccountDiscriminatorNotFound,
+    /// Account not enough keys
+    AccountNotEnoughKeys,
+    /// Account not signer
+    AccountNotSigner,
+    /// Other constraint
+    OtherConstraint,
 }

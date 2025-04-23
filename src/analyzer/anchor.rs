@@ -2,11 +2,12 @@
 
 use anyhow::{Result, anyhow, Context};
 use log::{info, debug, warn};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::hash::hash;
+use solana_pubkey::Pubkey;
+use sha2::{Sha256, Digest};
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::models::idl::IDL;
+use crate::constants::discriminators::anchor;
 use std::collections::{HashMap, HashSet};
 
 /// Anchor program analysis results
@@ -32,8 +33,11 @@ pub fn is_anchor_program(program_data: &[u8]) -> bool {
 /// Generate an Anchor instruction discriminator
 pub fn generate_discriminator(name: &str) -> [u8; 8] {
     let mut result = [0u8; 8];
-    let hash_bytes = hash(format!("global:{}", name).as_bytes()).to_bytes();
-    result.copy_from_slice(&hash_bytes[..8]);
+    let namespace = format!("global:{}", name);
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    let hash = hasher.finalize();
+    result.copy_from_slice(&hash[..8]);
     result
 }
 

@@ -53,7 +53,48 @@ fn ts_type_for(ty: &str) -> &str {
         _ if ty.starts_with("vec<") => "Array<any>",
         _ => "any",
     }
-} 
+}
 
-
-
+/// Improve TypeScript generation to include pattern information
+fn generate_typescript_with_patterns(idl: &IDL) -> Result<String> {
+    let mut ts_code = String::new();
+    
+    // Add imports
+    ts_code.push_str(&format!("// Generated TypeScript client for {}\n\n", idl.name));
+    ts_code.push_str("import * as web3 from '@solana/web3.js';\n");
+    ts_code.push_str("import * as borsh from 'borsh';\n\n");
+    
+    // Add discriminator constants for Anchor programs
+    if idl.metadata.origin == "anchor" {
+        ts_code.push_str("// Instruction discriminators\n");
+        for instruction in &idl.instructions {
+            if let Some(discriminator) = &instruction.discriminator {
+                let disc_str = discriminator.iter()
+                    .map(|b| format!("0x{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ts_code.push_str(&format!("export const {}Discriminator = new Uint8Array([{}]);\n", 
+                    instruction.name, disc_str));
+            }
+        }
+        ts_code.push_str("\n");
+        
+        // Add account discriminators
+        ts_code.push_str("// Account discriminators\n");
+        for account in &idl.accounts {
+            if let Some(discriminator) = &account.discriminator {
+                let disc_str = discriminator.iter()
+                    .map(|b| format!("0x{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ts_code.push_str(&format!("export const {}Discriminator = new Uint8Array([{}]);\n", 
+                    account.name, disc_str));
+            }
+        }
+        ts_code.push_str("\n");
+    }
+    
+    // Rest of the TypeScript generation...
+    
+    Ok(ts_code)
+}

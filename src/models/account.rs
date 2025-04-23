@@ -11,6 +11,8 @@ pub struct Account {
     pub ty: String,
     /// Account fields
     pub fields: Vec<AccountField>,
+    /// Discriminator for this account
+    pub discriminator: Option<Vec<u8>>,
 }
 
 /// Represents an account field
@@ -31,11 +33,22 @@ impl Account {
             name,
             ty,
             fields: Vec::new(),
+            discriminator: None,
         }
     }
     
     /// Add a field to the account
     pub fn add_field(&mut self, name: String, ty: String, offset: usize) {
         self.fields.push(AccountField { name, ty, offset });
+    }
+    
+    /// Set the discriminator for this account
+    pub fn set_discriminator(&mut self, discriminator: Vec<u8>) {
+        self.discriminator = Some(discriminator);
+    }
+    
+    /// Get the discriminator for this account
+    pub fn discriminator(&self) -> Option<&Vec<u8>> {
+        self.discriminator.as_ref()
     }
 } 

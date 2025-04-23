@@ -43,8 +43,7 @@ pub mod cache;  // New module for caching
 
 use std::path::Path;
 use anyhow::{Result, anyhow, Context};
-use solana_sdk::pubkey::Pubkey;
-use solana_client::rpc_client::RpcClient;
+use solana_pubkey::Pubkey;
 use log::{info, debug, warn, error};
 use std::time::Instant;
 
@@ -68,11 +67,8 @@ pub async fn extract_idl(
         }
     }
     
-    // Create RPC client
-    let rpc_client = RpcClient::new(rpc_url.to_string());
-    
     // Try to get program data
-    let program_data = match get_program_data(&rpc_client, program_id) {
+    let program_data = match monitor::rpc::get_program_data(rpc_url, program_id).await {
         Ok(data) => {
             info!("Successfully fetched program data ({} bytes)", data.len());
             data
@@ -181,43 +177,6 @@ fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::i
     idl.metadata.origin = "native".to_string();
     
     Ok(idl)
-}
-
-/// Get program data from the blockchain
-fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
-    info!("Fetching program data for: {}", program_id);
-    
-    // Get account data
-    match rpc_client.get_account(program_id) {
-        Ok(account) => {
-            info!("Successfully fetched account data, size: {} bytes", account.data.len());
-            
-            // Check if this is a program account
-            if !account.executable {
-                return Err(anyhow!("Account is not executable (not a program)"));
-            }
-            
-            // Print the first few bytes for debugging
-            let prefix = if account.data.len() >= 32 {
-                &account.data[0..32]
-            } else {
-                &account.data
-            };
-            
-            let prefix_hex = prefix.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            
-            debug!("First 32 bytes: {}", prefix_hex);
-            
-            Ok(account.data)
-        },
-        Err(err) => {
-            error!("Error fetching account: {}", err);
-            Err(anyhow!("Failed to fetch program data: {}", err))
-        }
-    }
 }
 
 /// Version of the IDL extractor

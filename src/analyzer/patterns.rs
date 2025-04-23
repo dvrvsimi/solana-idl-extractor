@@ -1,11 +1,14 @@
 //! Common instruction patterns for Solana programs
 
 use anyhow::Result;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;  // Updated import
 use solana_transaction_status::{UiTransactionEncoding, TransactionBinaryEncoding, UiMessage, UiInstruction};
 use crate::models::instruction::Instruction;
+use crate::constants::discriminators::program_ids;
 use log;
 use std::str::FromStr;
+use solana_clock::Clock;
+use solana_rent::Rent;
 
 /// Results of pattern analysis
 pub struct PatternAnalysis {
@@ -601,15 +604,19 @@ pub fn identify_account_type(
         return "program".to_string();
     }
     
-    if account_pubkey == &solana_sdk::system_program::id() {
+    if account_pubkey.to_string() == program_ids::SYSTEM_PROGRAM {
         return "system_program".to_string();
     }
     
-    if account_pubkey == &solana_sdk::sysvar::rent::id() {
+    if account_pubkey.to_string() == program_ids::TOKEN_PROGRAM {
+        return "token_program".to_string();
+    }
+    
+    if account_pubkey == &Rent::id() {
         return "rent".to_string();
     }
     
-    if account_pubkey == &solana_sdk::sysvar::clock::id() {
+    if account_pubkey == &Clock::id() {
         return "clock".to_string();
     }
     
