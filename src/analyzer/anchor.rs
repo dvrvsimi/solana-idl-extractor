@@ -3,11 +3,12 @@
 use anyhow::{Result, anyhow, Context};
 use log::{info, debug, warn};
 use solana_pubkey::Pubkey;
-use sha2::{Sha256, Digest};
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::models::idl::IDL;
-use crate::constants::discriminators::anchor;
+use crate::constants::anchor::{INSTRUCTION_PREFIX, ANCHOR_VERSION_PREFIX, ANCHOR_PATTERNS};
+use crate::utils::pattern::{find_pattern, extract_after_pattern};
+use crate::utils::hash::generate_anchor_discriminator;
 use std::collections::{HashMap, HashSet};
 
 /// Anchor program analysis results
@@ -22,35 +23,56 @@ pub struct AnchorAnalysis {
     pub is_anchor: bool,
 }
 
-/// Check if a program is an Anchor program
+/// Check if a program is an Anchor program by examining various indicators
 pub fn is_anchor_program(program_data: &[u8]) -> bool {
-    // Check for Anchor's characteristic log message pattern
-    // Anchor inserts "Instruction: X" log messages at the start of handlers
-    let pattern = b"Instruction: ";
-    program_data.windows(pattern.len()).any(|window| window == pattern)
-}
-
-/// Generate an Anchor instruction discriminator
-pub fn generate_discriminator(name: &str) -> [u8; 8] {
-    let mut result = [0u8; 8];
-    let namespace = format!("global:{}", name);
-    let mut hasher = Sha256::new();
-    hasher.update(namespace.as_bytes());
-    let hash = hasher.finalize();
-    result.copy_from_slice(&hash[..8]);
-    result
+    // Method 1: Check for Anchor's characteristic string patterns
+    if ANCHOR_PATTERNS.iter().any(|pattern| find_pattern(program_data, pattern)) {
+        return true;
+    }
+    
+    // Method 2: Look for Anchor version string
+    if extract_anchor_version(program_data).is_some() {
+        return true;
+    }
+    
+    // Method 3: Check for Anchor discriminator patterns in the code
+    // This looks for code that checks the first 8 bytes of an account or instruction
+    let discriminator_check_pattern = [
+        // Load 8 bytes (discriminator length)
+        0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    
+    if find_pattern(program_data, &discriminator_check_pattern) {
+        return true;
+    }
+    
+    // Method 4: Check for Anchor error codes
+    // Many Anchor programs contain these specific error codes
+    let error_code_patterns = [
+        // ConstraintMut (2000)
+        0xd0, 0x07, 0x00, 0x00,
+        // AccountDiscriminatorNotFound (3001)
+        0xb9, 0x0b, 0x00, 0x00,
+    ];
+    
+    for pattern in &error_code_patterns {
+        if find_pattern(program_data, pattern) {
+            return true;
+        }
+    }
+    
+    false
 }
 
 /// Extract instruction handlers from an Anchor program
 pub fn extract_instruction_handlers(program_data: &[u8]) -> Result<Vec<String>> {
     let mut handlers = Vec::new();
-    let pattern = b"Instruction: ";
     
     // Find all occurrences of "Instruction: X" in the program data
-    for (i, window) in program_data.windows(pattern.len()).enumerate() {
-        if window == pattern {
+    for (i, window) in program_data.windows(INSTRUCTION_PREFIX.len()).enumerate() {
+        if window == INSTRUCTION_PREFIX {
             // Extract the instruction name
-            let start = i + pattern.len();
+            let start = i + INSTRUCTION_PREFIX.len();
             let mut end = start;
             while end < program_data.len() && program_data[end] != 0 && program_data[end] != b'\n' {
                 end += 1;
@@ -82,14 +104,13 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
     
     let mut instructions = Vec::new();
     let mut accounts = Vec::new();
-    let mut error_codes = HashMap::new();
     
     // Create instructions from handler names
     for (i, name) in handler_names.iter().enumerate() {
         let mut instruction = Instruction::new(name.clone(), i as u8);
         
         // Add discriminator
-        let discriminator = generate_discriminator(name);
+        let discriminator = generate_anchor_discriminator(name);
         instruction.discriminator = Some(discriminator);
         
         // Add generic arguments and accounts
@@ -100,14 +121,8 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
         instructions.push(instruction);
     }
     
-    // Add common Anchor error codes
-    error_codes.insert(2000, "ConstraintMut".to_string());
-    error_codes.insert(2002, "ConstraintSigner".to_string());
-    error_codes.insert(2005, "ConstraintRentExempt".to_string());
-    error_codes.insert(2006, "ConstraintSeeds".to_string());
-    error_codes.insert(3001, "AccountDiscriminatorNotFound".to_string());
-    error_codes.insert(3005, "AccountNotEnoughKeys".to_string());
-    error_codes.insert(3010, "AccountNotSigner".to_string());
+    // Get common Anchor error codes
+    let error_codes = crate::constants::anchor::error_codes();
     
     Ok(AnchorAnalysis {
         instructions,
@@ -132,7 +147,7 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
     }
     
     // Add error codes
-    let error_codes = extract_error_codes(program_data);
+    let error_codes = crate::constants::anchor::error_codes();
     for (code, name) in error_codes {
         idl.add_error(code, name.clone(), name);
     }
@@ -143,42 +158,5 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
 /// Extract Anchor version from program data
 fn extract_anchor_version(program_data: &[u8]) -> Option<String> {
     // Look for version pattern in rodata section
-    let pattern = b"anchor-";
-    for (i, window) in program_data.windows(pattern.len()).enumerate() {
-        if window == pattern {
-            let start = i + pattern.len();
-            let mut end = start;
-            while end < program_data.len() && 
-                  (program_data[end].is_ascii_digit() || program_data[end] == b'.') {
-                end += 1;
-            }
-            
-            if let Ok(version) = std::str::from_utf8(&program_data[start..end]) {
-                if !version.is_empty() {
-                    return Some(version.to_string());
-                }
-            }
-        }
-    }
-    
-    None
-}
-
-/// Extract error codes from program data
-fn extract_error_codes(program_data: &[u8]) -> HashMap<u32, String> {
-    let mut error_codes = HashMap::new();
-    
-    // Add common Anchor error codes
-    error_codes.insert(2000, "ConstraintMut".to_string());
-    error_codes.insert(2002, "ConstraintSigner".to_string());
-    error_codes.insert(2005, "ConstraintRentExempt".to_string());
-    error_codes.insert(2006, "ConstraintSeeds".to_string());
-    error_codes.insert(3001, "AccountDiscriminatorNotFound".to_string());
-    error_codes.insert(3005, "AccountNotEnoughKeys".to_string());
-    error_codes.insert(3010, "AccountNotSigner".to_string());
-    
-    // Look for custom error codes in the program data
-    // This is a simplified approach - a more robust implementation would parse the ELF sections
-    
-    error_codes
+    extract_after_pattern(program_data, ANCHOR_VERSION_PREFIX, &[0, b'\n', b' '])
 } 

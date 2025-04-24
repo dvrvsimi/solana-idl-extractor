@@ -1,18 +1,14 @@
-//! ELF file handling for Solana programs
+//! ELF file parsing for Solana programs
 
 use anyhow::{Result, anyhow, Context};
+use goblin::elf::{Elf, header::{EM_BPF, ET_DYN, ET_EXEC}, section_header::*};
 use log::{debug, info, warn};
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
-use std::path::Path;
 use std::fs::File;
-use goblin::elf;
-use goblin::elf::header::{EM_BPF, EM_X86_64, EM_AARCH64};
-use goblin::elf::section_header::{SHT_SYMTAB, SHT_STRTAB, SHT_REL, SHT_RELA};
-use goblin::elf::dynamic::DT_NULL;
-use std::convert::TryInto;
+use std::io::Read;
+use std::path::Path;
 
-/// ELF section
+/// ELF section information
 #[derive(Debug, Clone)]
 pub struct ElfSection {
     /// Section name
@@ -20,230 +16,253 @@ pub struct ElfSection {
     /// Section data
     pub data: Vec<u8>,
     /// Section address
-    pub address: usize,
-    /// Section size
-    pub size: usize,
-}
-
-/// Parse ELF sections from program data
-pub fn parse_elf_sections(program_data: &[u8]) -> Result<Vec<ElfSection>> {
-    let mut sections = Vec::new();
-    
-    // Check ELF header
-    if program_data.len() < 64 {
-        return Err(anyhow!("Program data too small to be a valid ELF file"));
-    }
-    
-    // Get section header offset (e_shoff)
-    let sh_offset = u64::from_le_bytes(program_data[40..48].try_into().unwrap()) as usize;
-    
-    // Get section header entry size (e_shentsize)
-    let sh_entsize = u16::from_le_bytes(program_data[58..60].try_into().unwrap()) as usize;
-    
-    // Get number of section headers (e_shnum)
-    let sh_num = u16::from_le_bytes(program_data[60..62].try_into().unwrap()) as usize;
-    
-    // Get section header string table index (e_shstrndx)
-    let sh_strndx = u16::from_le_bytes(program_data[62..64].try_into().unwrap()) as usize;
-    
-    if sh_offset == 0 || sh_entsize == 0 || sh_num == 0 {
-        return Err(anyhow!("Invalid ELF section header information"));
-    }
-    
-    // Get section header string table
-    let str_hdr_offset = sh_offset + sh_strndx * sh_entsize;
-    if str_hdr_offset + 24 >= program_data.len() {
-        return Err(anyhow!("Invalid section header string table offset"));
-    }
-    
-    let str_offset = u64::from_le_bytes(program_data[str_hdr_offset + 24..str_hdr_offset + 32].try_into().unwrap()) as usize;
-    let str_size = u64::from_le_bytes(program_data[str_hdr_offset + 32..str_hdr_offset + 40].try_into().unwrap()) as usize;
-    
-    if str_offset + str_size > program_data.len() {
-        return Err(anyhow!("Invalid section header string table data"));
-    }
-    
-    let str_table = &program_data[str_offset..str_offset + str_size];
-    
-    // Parse section headers
-    for i in 0..sh_num {
-        let hdr_offset = sh_offset + i * sh_entsize;
-        if hdr_offset + sh_entsize > program_data.len() {
-            continue;
-        }
-        
-        // Get section name offset
-        let name_offset = u32::from_le_bytes(program_data[hdr_offset..hdr_offset + 4].try_into().unwrap()) as usize;
-        
-        // Get section offset
-        let offset = u64::from_le_bytes(program_data[hdr_offset + 24..hdr_offset + 32].try_into().unwrap()) as usize;
-        
-        // Get section size
-        let size = u64::from_le_bytes(program_data[hdr_offset + 32..hdr_offset + 40].try_into().unwrap()) as usize;
-        
-        // Get section address
-        let address = u64::from_le_bytes(program_data[hdr_offset + 16..hdr_offset + 24].try_into().unwrap()) as usize;
-        
-        if offset + size > program_data.len() {
-            continue;
-        }
-        
-        // Extract section name
-        let mut name_end = name_offset;
-        while name_end < str_table.len() && str_table[name_end] != 0 {
-            name_end += 1;
-        }
-        
-        let name = if name_offset < str_table.len() {
-            String::from_utf8_lossy(&str_table[name_offset..name_end]).to_string()
-        } else {
-            format!("section_{}", i)
-        };
-        
-        // Extract section data
-        let data = program_data[offset..offset + size].to_vec();
-        
-        sections.push(ElfSection {
-            name,
-            data,
-            address,
-            size,
-        });
-    }
-    
-    if sections.is_empty() {
-        return Err(anyhow!("No valid sections found"));
-    }
-    
-    Ok(sections)
-}
-
-/// Represents a relocation entry in an ELF file
-#[derive(Debug, Clone)]
-pub struct RelocationEntry {
-    pub offset: u64,      // Location to apply the relocation
-    pub symbol_index: u32, // Symbol table index
-    pub r_type: u32,      // Relocation type
-    pub addend: i64,      // Optional addend (for RELA type)
-}
-
-/// Represents a symbol from the ELF symbol table
-#[derive(Debug, Clone)]
-pub struct Symbol {
-    pub name: String,
     pub address: u64,
+    /// Section size
     pub size: u64,
-    pub binding: SymbolBinding,
-    pub symbol_type: SymbolType,
+    /// Section type
+    pub section_type: u32,
+    /// Section flags
+    pub flags: u64,
+}
+
+/// ELF symbol information
+#[derive(Debug, Clone)]
+pub struct ElfSymbol {
+    /// Symbol name
+    pub name: String,
+    /// Symbol address
+    pub address: u64,
+    /// Symbol size
+    pub size: u64,
+    /// Symbol type
+    pub sym_type: u8,
+    /// Symbol binding
+    pub binding: u8,
+    /// Symbol visibility
+    pub visibility: u8,
+    /// Symbol section index
     pub section_index: u16,
 }
 
-/// Symbol binding (local, global, weak)
-#[derive(Debug, Clone, PartialEq)]
-pub enum SymbolBinding {
-    Local,
-    Global,
-    Weak,
-    Unknown(u8),
-}
-
-/// Symbol type (object, function, section, etc.)
-#[derive(Debug, Clone, PartialEq)]
-pub enum SymbolType {
-    NoType,
-    Object,
-    Function,
-    Section,
-    File,
-    Common,
-    TLS,
-    Unknown(u8),
-}
-
-/// ELF analyzer
+/// ELF analyzer for Solana programs
 pub struct ElfAnalyzer<'a> {
-    elf_file: elf::Elf<'a>,
+    /// Parsed ELF file
+    elf: Elf<'a>,
+    /// Raw binary data
     data: &'a [u8],
 }
 
 impl<'a> ElfAnalyzer<'a> {
+    /// Create a new ELF analyzer from a file path
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let mut file = File::open(path)
+            .context("Failed to open ELF file")?;
+        
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)
+            .context("Failed to read ELF file")?;
+        
+        Self::from_bytes(&buffer)
+    }
+    
     /// Create a new ELF analyzer from bytes
     pub fn from_bytes(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(anyhow!("File too small"));
+        let elf = Elf::parse(data)
+            .context("Failed to parse ELF file")?;
+        
+        // Validate that this is a BPF ELF file
+        if elf.header.e_machine != EM_BPF {
+            warn!("ELF file is not a BPF program (machine type: {})", elf.header.e_machine);
         }
         
-        let elf_file = elf::Elf::parse(data)
-            .map_err(|e| anyhow!("Failed to parse ELF file: {}", e))?;
+        if elf.header.e_type != ET_EXEC && elf.header.e_type != ET_DYN {
+            warn!("ELF file is not an executable or shared object (type: {})", elf.header.e_type);
+        }
         
-        // Validate architecture
-        let arch = match elf_file.header.e_machine {
-            EM_BPF => "BPF",
-            EM_X86_64 => "x86_64",
-            EM_AARCH64 => "AArch64",
-            other => return Err(anyhow!("Unsupported architecture: {}", other)),
-        };
-        
-        debug!("Detected ELF architecture: {}", arch);
-        
-        Ok(Self {
-            elf_file,
-            data,
-        })
+        Ok(Self { elf, data })
     }
     
-    /// Get all functions from the symbol table
-    pub fn get_functions(&self) -> Result<Vec<Symbol>> {
-        let symbols = self.parse_symbols()?;
-        Ok(symbols.into_iter()
-            .filter(|sym| sym.symbol_type == SymbolType::Function)
-            .collect())
+    /// Get all sections in the ELF file
+    pub fn get_sections(&self) -> Result<Vec<ElfSection>> {
+        let mut sections = Vec::new();
+        
+        for section_header in &self.elf.section_headers {
+            let name = match self.elf.shdr_strtab.get_at(section_header.sh_name) {
+                Some(name) => name.to_string(),
+                None => format!("unknown_{}", section_header.sh_name),
+            };
+            
+            let offset = section_header.sh_offset as usize;
+            let size = section_header.sh_size as usize;
+            
+            let data = if offset > 0 && size > 0 && offset + size <= self.data.len() {
+                self.data[offset..offset + size].to_vec()
+            } else {
+                Vec::new()
+            };
+            
+            sections.push(ElfSection {
+                name,
+                data,
+                address: section_header.sh_addr,
+                size: section_header.sh_size,
+                section_type: section_header.sh_type,
+                flags: section_header.sh_flags,
+            });
+        }
+        
+        Ok(sections)
     }
     
-    /// Parse the symbol table and extract function names and addresses
-    pub fn parse_symbols(&self) -> Result<Vec<Symbol>> {
+    /// Get a specific section by name
+    pub fn get_section(&self, name: &str) -> Result<Option<ElfSection>> {
+        for section_header in &self.elf.section_headers {
+            if let Some(section_name) = self.elf.shdr_strtab.get_at(section_header.sh_name) {
+                if section_name == name {
+                    let offset = section_header.sh_offset as usize;
+                    let size = section_header.sh_size as usize;
+                    
+                    let data = if offset > 0 && size > 0 && offset + size <= self.data.len() {
+                        self.data[offset..offset + size].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    return Ok(Some(ElfSection {
+                        name: name.to_string(),
+                        data,
+                        address: section_header.sh_addr,
+                        size: section_header.sh_size,
+                        section_type: section_header.sh_type,
+                        flags: section_header.sh_flags,
+                    }));
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// Get all symbols in the ELF file
+    pub fn get_symbols(&self) -> Result<Vec<ElfSymbol>> {
         let mut symbols = Vec::new();
         
-        // Use goblin's built-in symbol table parsing
-        for sym in self.elf_file.syms.iter() {
-            let name = self.elf_file.strtab.get_at(sym.st_name)
-                .unwrap_or_default()
-                .to_string();
-            
-            // Extract binding and type from st_info
-            let binding = match (sym.st_info >> 4) & 0xf {
-                0 => SymbolBinding::Local,
-                1 => SymbolBinding::Global,
-                2 => SymbolBinding::Weak,
-                other => SymbolBinding::Unknown(other),
+        for sym in &self.elf.syms {
+            let name = match self.elf.strtab.get_at(sym.st_name) {
+                Some(name) => name.to_string(),
+                None => format!("unknown_{}", sym.st_name),
             };
             
-            let symbol_type = match sym.st_info & 0xf {
-                0 => SymbolType::NoType,
-                1 => SymbolType::Object,
-                2 => SymbolType::Function,
-                3 => SymbolType::Section,
-                4 => SymbolType::File,
-                5 => SymbolType::Common,
-                6 => SymbolType::TLS,
-                other => SymbolType::Unknown(other),
-            };
-            
-            symbols.push(Symbol {
+            symbols.push(ElfSymbol {
                 name,
                 address: sym.st_value,
                 size: sym.st_size,
-                binding,
-                symbol_type,
-                section_index: sym.st_shndx as u16,
+                sym_type: sym.st_type(),
+                binding: sym.st_bind(),
+                visibility: sym.st_visibility(),
+                section_index: sym.st_shndx,
             });
         }
         
         Ok(symbols)
     }
+    
+    /// Get the text section (code)
+    pub fn get_text_section(&self) -> Result<Option<ElfSection>> {
+        self.get_section(".text")
+    }
+    
+    /// Get the rodata section (read-only data)
+    pub fn get_rodata_section(&self) -> Result<Option<ElfSection>> {
+        self.get_section(".rodata")
+    }
+    
+    /// Get the data section
+    pub fn get_data_section(&self) -> Result<Option<ElfSection>> {
+        self.get_section(".data")
+    }
+    
+    /// Get the bss section (uninitialized data)
+    pub fn get_bss_section(&self) -> Result<Option<ElfSection>> {
+        self.get_section(".bss")
+    }
+    
+    /// Extract all string literals from the ELF file
+    pub fn extract_strings(&self) -> Result<Vec<String>> {
+        let mut strings = Vec::new();
+        
+        // Get the rodata section which typically contains string literals
+        if let Ok(Some(rodata)) = self.get_rodata_section() {
+            let mut i = 0;
+            while i < rodata.data.len() {
+                // Look for null-terminated strings
+                let start = i;
+                while i < rodata.data.len() && rodata.data[i] != 0 {
+                    i += 1;
+                }
+                
+                if i > start {
+                    // Found a potential string
+                    if let Ok(s) = std::str::from_utf8(&rodata.data[start..i]) {
+                        if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                            strings.push(s.to_string());
+                        }
+                    }
+                }
+                
+                i += 1;
+            }
+        }
+        
+        Ok(strings)
+    }
+    
+    /// Check if this is likely a Solana program
+    pub fn is_solana_program(&self) -> bool {
+        // Check for BPF architecture
+        if self.elf.header.e_machine != EM_BPF {
+            return false;
+        }
+        
+        // Check for Solana-specific symbols or strings
+        if let Ok(symbols) = self.get_symbols() {
+            for symbol in &symbols {
+                if symbol.name.contains("solana") || 
+                   symbol.name.contains("entrypoint") {
+                    return true;
+                }
+            }
+        }
+        
+        // Check for Solana-specific strings
+        if let Ok(strings) = self.extract_strings() {
+            for string in &strings {
+                if string.contains("solana") || 
+                   string.contains("Solana") || 
+                   string.contains("Program") {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
 }
 
-/// Find pattern in binary data
+/// Find a pattern in binary data
 pub fn find_pattern(data: &[u8], pattern: &[u8]) -> bool {
     data.windows(pattern.len()).any(|window| window == pattern)
+}
+
+/// Parse an ELF file and extract sections
+pub fn parse_elf(data: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
+    let analyzer = ElfAnalyzer::from_bytes(data)?;
+    let sections = analyzer.get_sections()?;
+    
+    let mut result = HashMap::new();
+    for section in sections {
+        result.insert(section.name, section.data);
+    }
+    
+    Ok(result)
 }

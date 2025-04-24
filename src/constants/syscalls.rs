@@ -60,3 +60,22 @@ pub mod syscalls {
     pub const SOL_BIG_INTEGER_DIVIDE: u32 = 0x92c5d5a9;
     pub const SOL_BIG_INTEGER_MODULO: u32 = 0xf3a5e9de;
 }
+
+/// Common Sealevel syscall hashes
+pub mod hashes {
+    pub const SOL_LOG: u32 = 0x3a6ed8;
+    pub const SOL_LOG_64: u32 = 0xb166;
+    pub const SOL_LOG_COMPUTE_UNITS: u32 = 0xd89;
+    pub const SOL_LOG_PUBKEY: u32 = 0x20a;
+    pub const SOL_CREATE_PROGRAM_ADDRESS: u32 = 0x10;
+    pub const SOL_TRY_FIND_PROGRAM_ADDRESS: u32 = 0x11;
+    pub const SOL_SHA256: u32 = 0x2;
+    pub const SOL_KECCAK256: u32 = 0x5;
+    pub const SOL_INVOKE_SIGNED: u32 = 0x12;
+    pub const SOL_INVOKE: u32 = 0x14;
+    pub const SOL_ALLOC_FREE: u32 = 0x15;
+    pub const SOL_MEMCPY: u32 = 0x16;
+    pub const SOL_MEMCMP: u32 = 0x17;
+    pub const SOL_MEMMOVE: u32 = 0x18;
+    pub const SOL_MEMSET: u32 = 0x19;
+}
