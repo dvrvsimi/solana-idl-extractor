@@ -1,9 +1,14 @@
-//! SBF instruction parsing
+//! SBF instruction parsing for Solana programs.
+//!
+//! This module provides utilities for parsing Solana BPF instructions
+//! from binary data. It includes support for different SBPF versions,
+//! instruction types, and error recovery mechanisms.
 
 use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use crate::constants::opcodes;
+use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
 
 /// SBPF version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,10 +43,25 @@ pub struct SbfInstruction {
 }
 
 impl SbfInstruction {
-    /// Parse an SBF instruction from a byte slice
-    pub fn parse(data: &[u8], address: usize) -> Result<Self> {
+    /// Parse an SBF instruction from a byte slice.
+    ///
+    /// This method parses a single SBF instruction from a byte slice,
+    /// extracting the opcode, registers, offset, and immediate value.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The byte slice containing the instruction.
+    /// * `address` - The address of the instruction in memory.
+    ///
+    /// # Returns
+    ///
+    /// A result containing the parsed instruction, or an error
+    /// if the data could not be parsed.
+    pub fn parse(data: &[u8], address: usize) -> ExtractorResult<Self> {
         if data.len() < 8 {
-            return Err(anyhow!("Instruction data too short"));
+            return Err(ExtractorError::BytecodeAnalysis(
+                format!("Instruction data too short at address 0x{:x}", address)
+            ));
         }
         
         let opcode = data[0];
@@ -63,11 +83,16 @@ impl SbfInstruction {
                 0x38 => 8,
                 _ => 0,
             },
-            version: detect_sbpf_version(data)?,
+            version: detect_sbpf_version(data)
+                .unwrap_or(SbpfVersion::V0),
         })
     }
     
-    /// Check if this is a jump instruction
+    /// Check if this is a jump instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is a jump instruction, `false` otherwise.
     pub fn is_jump(&self) -> bool {
         matches!(
             self.opcode,
@@ -82,27 +107,47 @@ impl SbfInstruction {
         )
     }
     
-    /// Check if this is a call instruction
+    /// Check if this is a call instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is a call instruction, `false` otherwise.
     pub fn is_call(&self) -> bool {
         self.opcode == opcodes::CALL || self.opcode == opcodes::CALLX
     }
     
-    /// Check if this is an exit instruction
+    /// Check if this is an exit instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is an exit instruction, `false` otherwise.
     pub fn is_exit(&self) -> bool {
         self.opcode == opcodes::EXIT || self.opcode == opcodes::RETURN
     }
     
-    /// Check if this is a load instruction
+    /// Check if this is a load instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is a load instruction, `false` otherwise.
     pub fn is_load(&self) -> bool {
         (self.opcode & 0xF0) == 0x20
     }
     
-    /// Check if this is a store instruction
+    /// Check if this is a store instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is a store instruction, `false` otherwise.
     pub fn is_store(&self) -> bool {
         (self.opcode & 0xF0) == 0x60
     }
     
-    /// Check if this is an ALU operation
+    /// Check if this is an ALU operation.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is an ALU operation, `false` otherwise.
     pub fn is_alu(&self) -> bool {
         matches!(
             self.opcode,
@@ -120,7 +165,11 @@ impl SbfInstruction {
         )
     }
     
-    /// Get the size of the load/store operation
+    /// Get the size of the load/store operation.
+    ///
+    /// # Returns
+    ///
+    /// The size of the load/store operation in bytes, or `None` if this is not a load/store instruction.
     pub fn mem_size(&self) -> Option<usize> {
         if self.is_load() || self.is_store() {
             Some(self.size)
@@ -129,13 +178,21 @@ impl SbfInstruction {
         }
     }
     
-    /// Check if this instruction is a V2+ ALU32 instruction
+    /// Check if this instruction is a V2+ ALU32 instruction.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this is a V2+ ALU32 instruction, `false` otherwise.
     pub fn is_alu32(&self) -> bool {
         self.version >= SbpfVersion::V2 && 
         (self.opcode & 0x07) == 0x04
     }
     
-    /// Check if this instruction uses a V3 syscall
+    /// Check if this instruction uses a V3 syscall.
+    ///
+    /// # Returns
+    ///
+    /// `true` if this instruction uses a V3 syscall, `false` otherwise.
     pub fn is_v3_syscall(&self) -> bool {
         self.version == SbpfVersion::V3 && 
         self.opcode == 0x85 &&
@@ -143,25 +200,79 @@ impl SbfInstruction {
     }
 }
 
-/// Parse instructions from a byte slice
-pub fn parse_instructions(data: &[u8], base_address: usize) -> Result<Vec<SbfInstruction>> {
+/// Parse instructions from a byte slice with improved error handling.
+///
+/// This function parses a sequence of SBF instructions from binary data,
+/// with support for different SBPF versions and error recovery mechanisms.
+/// It attempts to continue parsing even if some instructions are invalid.
+///
+/// # Arguments
+///
+/// * `data` - The binary data containing SBF instructions.
+/// * `base_address` - The base address of the instructions in memory.
+///
+/// # Returns
+///
+/// A result containing a vector of parsed instructions, or an error
+/// if the data could not be parsed.
+pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<Vec<SbfInstruction>> {
+    let context = ErrorContext {
+        program_id: None,
+        component: "bytecode_parser".to_string(),
+        operation: "parse_instructions".to_string(),
+        details: Some(format!("data_len={}, base_address=0x{:x}", data.len(), base_address)),
+    };
+    
     let mut instructions = Vec::new();
     let mut offset = 0;
     
     // Try to detect SBPF version from ELF header or instruction patterns
-    let version = detect_sbpf_version(data)?;
+    let version = detect_sbpf_version(data)
+        .map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to detect SBPF version: {}", e)))?;
     info!("Detected SBPF version: {:?}", version);
     
+    // Parse instructions with error recovery
     while offset + 8 <= data.len() {
-        let insn = SbfInstruction::parse(&data[offset..offset + 8], base_address + offset)?;
-        instructions.push(insn);
+        match SbfInstruction::parse(&data[offset..offset + 8], base_address + offset) {
+            Ok(insn) => {
+                instructions.push(insn);
+            },
+            Err(e) => {
+                // Log the error but continue parsing
+                warn!("Failed to parse instruction at offset 0x{:x}: {}", offset, e);
+                
+                // Try to recover by skipping this instruction
+                if instructions.is_empty() {
+                    // If we haven't parsed any instructions yet, this might not be valid bytecode
+                    return Err(ExtractorError::BytecodeAnalysis(
+                        format!("Failed to parse first instruction: {}", e)
+                    ));
+                }
+            }
+        }
         offset += 8;
+    }
+    
+    if instructions.is_empty() {
+        return Err(ExtractorError::BytecodeAnalysis(
+            "No valid instructions found in bytecode".to_string()
+        ));
     }
     
     Ok(instructions)
 }
 
-/// Extract discriminator from instruction data
+/// Extract discriminator from instruction data.
+///
+/// This function extracts the discriminator byte from instruction data.
+///
+/// # Arguments
+///
+/// * `data` - The instruction data.
+///
+/// # Returns
+///
+/// The discriminator byte, or 0 if the data is empty.
 pub fn extract_discriminator(data: &[u8]) -> u8 {
     if data.is_empty() {
         return 0;
@@ -170,7 +281,18 @@ pub fn extract_discriminator(data: &[u8]) -> u8 {
     data[0]
 }
 
-/// Add this function for the tests
+/// Infer parameter types from instruction data.
+///
+/// This function analyzes instruction data to infer the types of parameters
+/// based on their sizes and patterns.
+///
+/// # Arguments
+///
+/// * `data` - The instruction data to analyze.
+///
+/// # Returns
+///
+/// A vector of inferred parameter types.
 pub fn infer_parameter_types(data: &[u8]) -> Vec<String> {
     // Implementation based on data size and patterns
     if data.is_empty() {
@@ -214,8 +336,20 @@ pub fn infer_parameter_types(data: &[u8]) -> Vec<String> {
     types
 }
 
-/// Detect SBPF version from bytecode
-fn detect_sbpf_version(data: &[u8]) -> Result<SbpfVersion> {
+/// Detect SBPF version from bytecode.
+///
+/// This function analyzes bytecode to determine the SBPF version
+/// based on instruction patterns and ELF header information.
+///
+/// # Arguments
+///
+/// * `data` - The bytecode to analyze.
+///
+/// # Returns
+///
+/// A result containing the detected SBPF version, or an error
+/// if the version could not be determined.
+fn detect_sbpf_version(data: &[u8]) -> ExtractorResult<SbpfVersion> {
     // Check ELF header for version information
     if data.len() >= 0x40 {
         // Check e_flags in ELF header (offset 0x24, 4 bytes)

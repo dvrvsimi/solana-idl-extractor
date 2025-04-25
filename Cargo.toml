@@ -18,6 +18,7 @@ base64 = "0.13"
 dirs = "4.0"
 tokio = { version = "1.0", features = ["full"] }
 sha2 = "0.10"
+thiserror = "1.0"
 
 # Low-level Solana dependencies
 solana-account = "2.2.1"
@@ -30,6 +31,8 @@ solana-signature = "2.2.1"
 solana-sdk-ids = "2.2.1"
 solana-clock = "1.18.4"
 solana-rent = "1.18.4" 
+
+# For transaction parsing
 solana-client = "2.2.1"
 solana-program = "2.2.1"
 
@@ -38,6 +41,8 @@ reqwest = { version = "0.11", features = ["json"] }
 
 # For ELF parsing
 goblin = "0.6"
+
+
 
 [dev-dependencies]
 solana-program-test = "2.2.6"

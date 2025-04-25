@@ -9,6 +9,7 @@ use log;
 use std::str::FromStr;
 use solana_clock::Clock;
 use solana_rent::Rent;
+use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
 
 /// Results of pattern analysis
 pub struct PatternAnalysis {
@@ -46,11 +47,25 @@ pub struct AccountPattern {
 pub fn analyze(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
-) -> Result<PatternAnalysis> {
-    let instruction_data = extract_instruction_data(program_id, transactions);
-    let instruction_patterns = analyze_instruction_patterns(&instruction_data);
+) -> ExtractorResult<PatternAnalysis> {
+    let context = ErrorContext {
+        program_id: Some(program_id.to_string()),
+        component: "pattern_analyzer".to_string(),
+        operation: "analyze_patterns".to_string(),
+        details: Some(format!("transaction_count={}", transactions.len())),
+    };
     
-    let account_patterns = analyze_account_patterns(program_id, transactions);
+    // Extract instruction data with better error handling
+    let instruction_data = extract_instruction_data(program_id, transactions)
+        .with_simple_context("pattern_analyzer", "extract_instruction_data")?;
+    
+    // Analyze instruction patterns
+    let instruction_patterns = analyze_instruction_patterns(&instruction_data)
+        .with_simple_context("pattern_analyzer", "analyze_instruction_patterns")?;
+    
+    // Analyze account patterns
+    let account_patterns = analyze_account_patterns(program_id, transactions)
+        .with_simple_context("pattern_analyzer", "analyze_account_patterns")?;
     
     Ok(PatternAnalysis {
         instruction_patterns,
@@ -62,7 +77,7 @@ pub fn analyze(
 pub fn extract_instruction_data(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
-) -> Vec<Vec<u8>> {
+) -> ExtractorResult<Vec<Vec<u8>>> {
     let mut instruction_data = Vec::new();
     
     for transaction in transactions {
@@ -112,12 +127,12 @@ pub fn extract_instruction_data(
                 match encoding {
                     TransactionBinaryEncoding::Base58 => {
                         if let Ok(tx_data) = bs58::decode(data).into_vec() {
-                            extract_from_binary(&tx_data, program_id, &mut instruction_data);
+                            extract_from_binary(&tx_data, program_id, &mut instruction_data)?;
                         }
                     },
                     TransactionBinaryEncoding::Base64 => {
                         if let Ok(tx_data) = base64::decode(data) {
-                            extract_from_binary(&tx_data, program_id, &mut instruction_data);
+                            extract_from_binary(&tx_data, program_id, &mut instruction_data)?;
                         }
                     },
                     _ => {
@@ -132,42 +147,39 @@ pub fn extract_instruction_data(
         }
     }
     
-    instruction_data
+    Ok(instruction_data)
 }
 
-/// Extract instruction data from binary transaction data
-fn extract_from_binary(tx_data: &[u8], program_id: &Pubkey, instruction_data: &mut Vec<Vec<u8>>) {
-    // This is a simplified implementation
-    // In a real implementation, we would parse the transaction format
-    // and extract instructions for our program
-    
-    // Look for program ID in the transaction data
-    let program_id_bytes = program_id.to_bytes();
-    
-    // Scan for program ID followed by instruction data
-    // This is a heuristic approach and may not work for all transactions
-    for window in tx_data.windows(program_id_bytes.len()) {
-        if window == program_id_bytes.as_ref() {
-            // Found program ID, try to extract instruction data
-            // Typically, instruction data follows the program ID and account indices
-            // This is a simplified approach
-            let pos = window.as_ptr() as usize - tx_data.as_ptr() as usize;
-            if pos + program_id_bytes.len() + 1 < tx_data.len() {
-                // Extract a chunk of data after the program ID
-                // In a real implementation, we would parse the exact instruction data
-                let data_start = pos + program_id_bytes.len() + 1;
-                let data_end = std::cmp::min(data_start + 32, tx_data.len());
-                let data = tx_data[data_start..data_end].to_vec();
-                if !data.is_empty() {
-                    instruction_data.push(data);
-                }
+/// Extract instruction data from binary transaction data with improved error handling
+fn extract_from_binary(tx_data: &[u8], program_id: &Pubkey, instruction_data: &mut Vec<Vec<u8>>) -> ExtractorResult<()> {
+    match crate::utils::transaction_parser::parse_transaction(tx_data) {
+        Ok((data, _)) => {
+            instruction_data.push(data);
+            Ok(())
+        },
+        Err(e) => {
+            // Log the error but don't fail the entire analysis
+            debug!("Failed to parse transaction: {}", e);
+            
+            // Try a fallback approach for this specific transaction
+            if tx_data.len() > 1 {
+                // Simple fallback: just take the first byte as discriminator and the rest as data
+                let fallback_data = tx_data.to_vec();
+                debug!("Using fallback approach: treating first byte as discriminator");
+                instruction_data.push(fallback_data);
+                Ok(())
+            } else {
+                // If we can't even do that, return the error
+                Err(ExtractorError::TransactionParsing(
+                    format!("Failed to parse transaction and no fallback available: {}", e)
+                ))
             }
         }
     }
 }
 
 /// Analyze instruction patterns
-fn analyze_instruction_patterns(instruction_data: &[Vec<u8>]) -> Vec<InstructionPattern> {
+fn analyze_instruction_patterns(instruction_data: &[Vec<u8>]) -> ExtractorResult<Vec<InstructionPattern>> {
     let mut patterns = Vec::new();
     
     // Count instruction frequencies by discriminator
@@ -205,7 +217,7 @@ fn analyze_instruction_patterns(instruction_data: &[Vec<u8>]) -> Vec<Instruction
         });
     }
     
-    patterns
+    Ok(patterns)
 }
 
 /// Try to infer parameter types from instruction data
@@ -283,7 +295,7 @@ fn infer_parameter_types(data: &[u8]) -> Vec<String> {
 fn analyze_account_patterns(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
-) -> Vec<AccountPattern> {
+) -> ExtractorResult<Vec<AccountPattern>> {
     let mut patterns = Vec::new();
     let mut frequency_map = std::collections::HashMap::new();
     
@@ -344,7 +356,7 @@ fn analyze_account_patterns(
     // Sort by frequency (most common first)
     patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
     
-    patterns
+    Ok(patterns)
 }
 
 /// Extract the instruction discriminator
@@ -527,7 +539,7 @@ pub fn infer_parameter_types_from_samples(samples: &[&[u8]]) -> Vec<String> {
 pub fn detect_account_patterns(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
-) -> Vec<AccountPattern> {
+) -> ExtractorResult<Vec<AccountPattern>> {
     let mut patterns = Vec::new();
     let mut frequency_map = std::collections::HashMap::new();
     
@@ -588,7 +600,7 @@ pub fn detect_account_patterns(
     // Sort by frequency (most common first)
     patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
     
-    patterns
+    Ok(patterns)
 }
 
 /// Try to identify the account type based on its usage pattern

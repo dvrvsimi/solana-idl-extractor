@@ -23,6 +23,7 @@ use crate::models::instruction::Instruction as IdlInstruction;
 use crate::models::account::Account as IdlAccount;
 use crate::constants::discriminator::ANCHOR_DISCRIMINATOR_LENGTH;
 use crate::utils::hash::generate_anchor_discriminator;
+use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
 
 /// Simulation result for a single instruction
 #[derive(Debug, Clone)]
@@ -151,15 +152,24 @@ impl TransactionSimulator {
         Ok(results)
     }
     
-    /// Simulate a specific instruction
-    pub async fn simulate_instruction(&self, instruction: &IdlInstruction) -> Result<SimulationResult> {
+    /// Simulate a specific instruction with improved error handling
+    pub async fn simulate_instruction(&self, instruction: &IdlInstruction) -> ExtractorResult<SimulationResult> {
+        let context = ErrorContext {
+            program_id: Some(self.program_id.to_string()),
+            component: "transaction_simulator".to_string(),
+            operation: format!("simulate_instruction_{}", instruction.name),
+            details: None,
+        };
+        
         info!("Simulating instruction: {}", instruction.name);
         
         // Generate mock accounts for the instruction
-        let (accounts, account_data) = self.generate_mock_accounts(instruction)?;
+        let (accounts, account_data) = self.generate_mock_accounts(instruction)
+            .map_err(|e| ExtractorError::Simulation(format!("Failed to generate mock accounts: {}", e)))?;
         
         // Generate instruction data
-        let instruction_data = self.generate_instruction_data(instruction)?;
+        let instruction_data = self.generate_instruction_data(instruction)
+            .map_err(|e| ExtractorError::Simulation(format!("Failed to generate instruction data: {}", e)))?;
         
         // Create the instruction
         let ix = Instruction {
@@ -169,18 +179,21 @@ impl TransactionSimulator {
         };
         
         // Add compute budget instruction to avoid hitting limits
-        let compute_budget_ix = self.create_compute_budget_instruction(1_400_000)?;
+        let compute_budget_ix = self.create_compute_budget_instruction(1_400_000)
+            .map_err(|e| ExtractorError::Simulation(format!("Failed to create compute budget instruction: {}", e)))?;
         
         // Create a transaction
         let message = Message::new(&[compute_budget_ix, ix], Some(&self.payer.pubkey()));
         let mut tx = Transaction::new_unsigned(message);
         
         // Sign the transaction
-        let recent_blockhash = self.get_recent_blockhash().await?;
+        let recent_blockhash = self.get_recent_blockhash().await
+            .map_err(|e| ExtractorError::Simulation(format!("Failed to get recent blockhash: {}", e)))?;
         tx.sign(&[&self.payer], recent_blockhash);
         
-        // Simulate the transaction
-        let result = self.simulate_transaction(&tx).await?;
+        // Simulate the transaction with retry logic
+        let result = self.simulate_transaction_with_retry(&tx, 3).await
+            .map_err(|e| ExtractorError::Simulation(format!("Transaction simulation failed: {}", e)))?;
         
         // Extract logs
         let logs = if let Some(logs) = result.value.logs {
@@ -200,7 +213,8 @@ impl TransactionSimulator {
         let compute_units = result.value.units_consumed.unwrap_or(0);
         
         // Analyze account changes
-        let account_changes = self.analyze_account_changes(&account_data, &logs, &result)?;
+        let account_changes = self.analyze_account_changes(&account_data, &logs, &result)
+            .map_err(|e| ExtractorError::Simulation(format!("Failed to analyze account changes: {}", e)))?;
         
         Ok(SimulationResult {
             instruction: instruction.clone(),
@@ -209,6 +223,34 @@ impl TransactionSimulator {
             error,
             compute_units,
         })
+    }
+    
+    /// Simulate a transaction with retry logic
+    async fn simulate_transaction_with_retry(&self, transaction: &Transaction, retries: usize) -> ExtractorResult<SimulateResult> {
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts < retries {
+            match self.simulate_transaction(transaction).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempts += 1;
+                    last_error = Some(ExtractorError::Simulation(format!("Simulation attempt {} failed: {}", attempts, e)));
+                    
+                    if attempts < retries {
+                        // Exponential backoff
+                        let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempts as u32));
+                        warn!("Simulation attempt {} failed, retrying in {:?}: {}", 
+                              attempts, delay, e);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| 
+            ExtractorError::Simulation("Simulation failed with unknown error".to_string())
+        ))
     }
     
     /// Generate mock accounts for an instruction
@@ -670,4 +712,26 @@ pub fn generate_anchor_account_discriminator(name: &str) -> [u8; 8] {
     let mut discriminator = [0u8; 8];
     discriminator.copy_from_slice(&result[..8]);
     discriminator
+}
+
+/// Extract instruction from transaction data with improved error handling
+fn extract_instruction_from_transaction(transaction_data: &[u8], program_id: &Pubkey) -> ExtractorResult<Instruction> {
+    let context = ErrorContext {
+        program_id: Some(program_id.to_string()),
+        component: "transaction_simulator".to_string(),
+        operation: "extract_instruction".to_string(),
+        details: Some(format!("data_len={}", transaction_data.len())),
+    };
+    
+    let (data, accounts) = crate::utils::transaction_parser::parse_transaction(transaction_data)
+        .with_context(context.clone())?;
+    
+    // Create an instruction from the parsed data
+    let instruction = Instruction {
+        program_id: *program_id,
+        accounts,
+        data,
+    };
+    
+    Ok(instruction)
 }
