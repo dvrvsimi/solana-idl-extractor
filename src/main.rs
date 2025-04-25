@@ -1,6 +1,6 @@
 use anyhow::Result;
 use solana_idl_extractor::{extract_idl, cache::Cache};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use std::path::PathBuf;
 use std::str::FromStr;
 use env_logger::Builder;
@@ -27,7 +27,13 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     
-    // Check for --clear-cache command first, before any other processing
+    // Check for --version command
+    if args.len() > 1 && (args[1] == "--version" || args[1] == "-v") {
+        println!("Solana IDL Extractor v{}", solana_idl_extractor::VERSION);
+        return Ok(());
+    }
+    
+    // Check for --clear-cache command
     if args.len() > 1 && args[1] == "--clear-cache" {
         if args.len() > 2 {
             match Pubkey::from_str(&args[2]) {
@@ -49,8 +55,18 @@ async fn main() -> Result<()> {
     
     // Regular command processing for IDL extraction
     if args.len() < 2 {
-        println!("Usage: {} <PROGRAM_ID> [--output PATH] [--cluster URL] [--no-cache]", args[0]);
-        println!("       {} --clear-cache [PROGRAM_ID]", args[0]);
+        println!("Solana IDL Extractor v{}", solana_idl_extractor::VERSION);
+        println!("\nUsage:");
+        println!("  {} <PROGRAM_ID> [--output PATH] [--cluster URL] [--no-cache] [--simulate]", args[0]);
+        println!("  {} --clear-cache [PROGRAM_ID]", args[0]);
+        println!("  {} --version", args[0]);
+        println!("\nOptions:");
+        println!("  --output, -o PATH    Save IDL to the specified file path");
+        println!("  --cluster, -c URL    Use the specified RPC URL (default: mainnet-beta)");
+        println!("  --no-cache           Don't use cached results");
+        println!("  --simulate, -s       Enhance IDL with transaction simulation");
+        println!("  --clear-cache        Clear the cache for all programs or a specific program");
+        println!("  --version, -v        Show version information");
         return Ok(());
     }
     
@@ -61,6 +77,7 @@ async fn main() -> Result<()> {
     let mut output_path = None;
     let mut cluster = "https://api.mainnet-beta.solana.com".to_string();
     let mut no_cache = false;
+    let mut simulate = false;
     
     let mut i = 2;
     while i < args.len() {
@@ -87,6 +104,10 @@ async fn main() -> Result<()> {
                 no_cache = true;
                 i += 1;
             },
+            "--simulate" | "-s" => {
+                simulate = true;
+                i += 1;
+            },
             _ => {
                 println!("Unknown argument: {}", args[i]);
                 i += 1;
@@ -98,7 +119,12 @@ async fn main() -> Result<()> {
     println!("Extracting IDL for program: {}", program_id);
     
     // Extract IDL
-    let idl = extract_idl(&program_id, &cluster, output_path.as_deref(), !no_cache).await?;
+    let idl = if simulate {
+        println!("Using transaction simulation to enhance IDL...");
+        solana_idl_extractor::extract_idl_with_simulation(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
+    } else {
+        extract_idl(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
+    };
     
     // Print IDL if no output path specified
     if output_path.is_none() {

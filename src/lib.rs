@@ -39,120 +39,127 @@ pub mod analyzer;
 pub mod monitor;
 pub mod models;
 pub mod generator;
-pub mod cache;  // New module for caching
+pub mod cache;
+pub mod constants;
+pub mod utils;
 
 use std::path::Path;
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Result, Context};
+use log::{info, debug, warn};
 use solana_pubkey::Pubkey;
-use log::{info, debug, warn, error};
-use std::time::Instant;
+use solana_client::rpc_client::RpcClient;
 
-use crate::cache::Cache;
+// Re-export key types
+pub use models::idl::IDL;
+pub use analyzer::simulation::TransactionSimulator;
 
-/// Main entry point for extracting IDL from a program
+/// Version of the tool
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Extract IDL from a Solana program
 pub async fn extract_idl(
     program_id: &Pubkey,
     rpc_url: &str,
     output_path: Option<&Path>,
     use_cache: bool,
-) -> Result<models::idl::IDL> {
-    let start = Instant::now();
-    info!("Starting IDL extraction for program: {}", program_id);
+) -> Result<IDL> {
+    info!("Extracting IDL for program: {}", program_id);
     
     // Check cache first if enabled
     if use_cache {
-        if let Some(cached_idl) = Cache::get_idl(program_id)? {
+        if let Ok(Some(cached_idl)) = cache::Cache::get_idl(program_id) {
             info!("Using cached IDL for program: {}", program_id);
             return Ok(cached_idl);
         }
     }
     
-    // Try to get program data
-    let program_data = match monitor::rpc::get_program_data(rpc_url, program_id).await {
-        Ok(data) => {
-            info!("Successfully fetched program data ({} bytes)", data.len());
-            data
-        },
-        Err(err) => {
-            warn!("Error fetching program data: {}", err);
-            info!("Creating minimal IDL");
-            
-            let idl = create_minimal_idl(program_id, "Failed to fetch program data");
-            
-            // Save IDL if output path provided
-            if let Some(path) = output_path {
-                if let Err(e) = generator::save_idl(&idl, path) {
-                    warn!("Failed to save minimal IDL: {}", e);
-                }
-            }
-            
-            return Ok(idl);
-        }
-    };
+    // Create monitor for blockchain interaction
+    let monitor = monitor::Monitor::new(rpc_url)
+        .context("Failed to create monitor")?;
     
-    // Analyze program
-    let idl = match analyze_program(program_id, &program_data) {
-        Ok(idl) => idl,
-        Err(err) => {
-            warn!("Error analyzing program: {}", err);
-            info!("Creating minimal IDL");
-            
-            create_minimal_idl(program_id, &format!("Failed to analyze program: {}", err))
-        }
-    };
+    // Create analyzer
+    let analyzer = analyzer::Analyzer::new();
     
-    // Save IDL if output path provided
+    // Analyze bytecode
+    let bytecode_analysis = analyzer.analyze_bytecode(program_id, &monitor).await
+        .context("Failed to analyze bytecode")?;
+    
+    // Analyze transaction patterns
+    let pattern_analysis = analyzer.analyze_patterns(program_id, &monitor).await
+        .context("Failed to analyze transaction patterns")?;
+    
+    // Build IDL
+    let idl = analyzer.build_idl(program_id, bytecode_analysis, pattern_analysis)
+        .context("Failed to build IDL")?;
+    
+    // Save to cache
+    if use_cache {
+        if let Err(e) = cache::Cache::save_idl(program_id, &idl) {
+            warn!("Failed to cache IDL: {}", e);
+        }
+    }
+    
+    // Save to file if path provided
     if let Some(path) = output_path {
         generator::save_idl(&idl, path)
             .with_context(|| format!("Failed to save IDL to {}", path.display()))?;
+        
         info!("Saved IDL to {}", path.display());
     }
-    
-    // Cache the result if caching is enabled
-    if use_cache {
-        if let Err(e) = Cache::save_idl(program_id, &idl) {
-            warn!("Failed to cache IDL: {}", e);
-        } else {
-            debug!("Cached IDL for program: {}", program_id);
-        }
-    }
-    
-    let elapsed = start.elapsed();
-    info!("IDL extraction completed in {:.2?}", elapsed);
     
     Ok(idl)
 }
 
-/// Create a minimal IDL when analysis fails
-fn create_minimal_idl(program_id: &Pubkey, reason: &str) -> models::idl::IDL {
-    let mut idl = models::idl::IDL::new(
-        format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-        program_id.to_string()
-    );
+/// Extract IDL from a Solana program with transaction simulation
+pub async fn extract_idl_with_simulation(
+    program_id: &Pubkey,
+    rpc_url: &str,
+    output_path: Option<&Path>,
+    use_cache: bool,
+) -> Result<IDL> {
+    // First, extract the basic IDL
+    let mut idl = extract_idl(program_id, rpc_url, None, use_cache).await?;
     
-    // Add a generic instruction
-    let mut instruction = models::instruction::Instruction::new("process".to_string(), 0);
-    instruction.add_arg("data".to_string(), "bytes".to_string());
-    idl.add_instruction(instruction);
+    // Then enhance it with transaction simulation
+    info!("Enhancing IDL with transaction simulation...");
     
-    // Add a generic account
-    let mut account = models::account::Account::new("State".to_string(), "state".to_string());
-    account.add_field("data".to_string(), "bytes".to_string(), 0);
-    idl.add_account(account);
+    // Create a transaction simulator
+    let simulator = TransactionSimulator::new(rpc_url, program_id, idl.clone())?;
     
-    // Add metadata
-    idl.metadata.address = program_id.to_string();
-    idl.metadata.origin = "unknown".to_string();
-    idl.metadata.notes = Some(format!("Minimal IDL created because: {}", reason));
+    // Simulate all instructions
+    let simulation_results = simulator.simulate_all().await?;
     
-    idl
+    // Enhance the IDL based on simulation results
+    idl = simulator.enhance_idl(&simulation_results)?;
+    
+    // Save the enhanced IDL if an output path was provided
+    if let Some(path) = output_path {
+        let enhanced_path = path.with_file_name(format!(
+            "{}_enhanced{}",
+            path.file_stem().unwrap().to_string_lossy(),
+            path.extension().map_or_else(|| "".to_string(), |ext| format!(".{}", ext.to_string_lossy()))
+        ));
+        
+        generator::save_idl(&idl, &enhanced_path)
+            .with_context(|| format!("Failed to save enhanced IDL to {}", enhanced_path.display()))?;
+        
+        info!("Enhanced IDL saved to {}", enhanced_path.display());
+    }
+    
+    Ok(idl)
 }
 
 /// Analyze a Solana program and extract its IDL
 fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
     info!("Analyzing program: {}", program_id);
     
-    // Analyze bytecode
+    // First, check if this is an Anchor program
+    if analyzer::anchor::is_anchor_program(program_data) {
+        info!("Detected Anchor program, using Anchor-specific analysis");
+        return analyze_anchor_program(program_id, program_data);
+    }
+    
+    // If not Anchor, use the general bytecode analyzer
     let bytecode_analysis = analyzer::bytecode::analyze(program_data, &program_id.to_string())
         .with_context(|| "Failed to analyze program bytecode")?;
     
@@ -172,6 +179,11 @@ fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::i
         idl.add_account(account);
     }
     
+    // Add error codes
+    for (code, name) in bytecode_analysis.error_codes {
+        idl.add_error(code, name.clone(), name);
+    }
+    
     // Add metadata
     idl.metadata.address = program_id.to_string();
     idl.metadata.origin = "native".to_string();
@@ -179,5 +191,41 @@ fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::i
     Ok(idl)
 }
 
-/// Version of the IDL extractor
-pub const VERSION: &str = env!("CARGO_PKG_VERSION"); 
+/// Analyze an Anchor program and extract its IDL
+fn analyze_anchor_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
+    info!("Analyzing Anchor program: {}", program_id);
+    
+    // Use Anchor-specific analysis
+    let anchor_analysis = analyzer::anchor::analyze(program_id, program_data)
+        .with_context(|| "Failed to analyze Anchor program")?;
+    
+    // Create IDL
+    let mut idl = models::idl::IDL::new(
+        format!("anchor_program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+        program_id.to_string()
+    );
+    
+    // Add instructions
+    for instruction in anchor_analysis.instructions {
+        idl.add_instruction(instruction);
+    }
+    
+    // Add accounts
+    for account in anchor_analysis.accounts {
+        idl.add_account(account);
+    }
+    
+    // Add error codes
+    for (code, name) in anchor_analysis.error_codes {
+        idl.add_error(code, name.clone(), name);
+    }
+    
+    // Add metadata
+    idl.metadata.address = program_id.to_string();
+    idl.metadata.origin = "anchor".to_string();
+    
+    // Enhance IDL with additional Anchor-specific information
+    analyzer::anchor::enhance_idl(&mut idl, program_data)?;
+    
+    Ok(idl)
+} 

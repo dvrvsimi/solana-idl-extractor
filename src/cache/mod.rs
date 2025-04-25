@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context};
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use crate::models::idl::IDL;
 use log::{debug, warn};
 

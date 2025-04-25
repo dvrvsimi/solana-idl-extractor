@@ -3,13 +3,13 @@
 pub mod bytecode;
 pub mod anchor;
 pub mod patterns;
+pub mod simulation;
 
 #[cfg(test)]
 mod tests;
 
 use anyhow::Result;
 use solana_pubkey::Pubkey;
-use solana_client::rpc_client::RpcClient;
 use log::{info, warn};
 
 use crate::models::idl::IDL;
@@ -18,6 +18,7 @@ use crate::monitor::Monitor;
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
 pub use self::patterns::PatternAnalysis;
+pub use self::simulation::TransactionSimulator;
 
 /// Analyzer for Solana programs
 pub struct Analyzer {
@@ -40,16 +41,16 @@ impl Analyzer {
     }
     
     /// Analyze transaction patterns
-    pub async fn analyze_patterns(&self, program_id: &Pubkey, monitor: &Monitor) -> Result<patterns_simplified::PatternAnalysis> {
+    pub async fn analyze_patterns(&self, program_id: &Pubkey, monitor: &Monitor) -> Result<patterns::PatternAnalysis> {
         // Get recent transactions
         let transactions = monitor.get_recent_transactions(program_id).await?;
         
         // Analyze patterns
-        patterns_simplified::analyze(program_id, &transactions)
+        patterns::analyze(program_id, &transactions)
     }
     
     /// Build IDL from analyses
-    pub fn build_idl(&self, program_id: &Pubkey, bytecode_analysis: bytecode::BytecodeAnalysis, pattern_analysis: patterns_simplified::PatternAnalysis) -> Result<IDL> {
+    pub fn build_idl(&self, program_id: &Pubkey, bytecode_analysis: bytecode::BytecodeAnalysis, pattern_analysis: patterns::PatternAnalysis) -> Result<IDL> {
         // Create IDL
         let mut idl = IDL::new(format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), program_id.to_string());
         

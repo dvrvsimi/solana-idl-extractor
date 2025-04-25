@@ -103,7 +103,6 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
         .context("Failed to extract instruction handlers")?;
     
     let mut instructions = Vec::new();
-    let mut accounts = Vec::new();
     
     // Create instructions from handler names
     for (i, name) in handler_names.iter().enumerate() {
@@ -121,8 +120,13 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
         instructions.push(instruction);
     }
     
-    // Get common Anchor error codes
-    let error_codes = crate::constants::anchor::error_codes();
+    // Extract account structures
+    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures(program_data)
+        .context("Failed to extract account structures")?;
+    
+    // Extract custom error codes
+    let error_codes = extract_custom_error_codes(program_data)
+        .context("Failed to extract error codes")?;
     
     Ok(AnchorAnalysis {
         instructions,
@@ -146,8 +150,11 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
         idl.metadata.framework_version = Some(version);
     }
     
-    // Add error codes
-    let error_codes = crate::constants::anchor::error_codes();
+    // Extract custom error codes
+    let error_codes = extract_custom_error_codes(program_data)
+        .context("Failed to extract error codes")?;
+    
+    // Add error codes to IDL
     for (code, name) in error_codes {
         idl.add_error(code, name.clone(), name);
     }
@@ -159,4 +166,92 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
 fn extract_anchor_version(program_data: &[u8]) -> Option<String> {
     // Look for version pattern in rodata section
     extract_after_pattern(program_data, ANCHOR_VERSION_PREFIX, &[0, b'\n', b' '])
+}
+
+/// Extract custom error codes from program data
+pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, String>> {
+    // Start with standard Anchor error codes
+    let mut error_codes = crate::constants::anchor::error_codes();
+    
+    // Try to parse the ELF file
+    let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data)?;
+    
+    // Extract strings from the rodata section
+    if let Ok(Some(rodata)) = elf_analyzer.get_rodata_section() {
+        // Look for error message patterns
+        let error_patterns = [
+            "Error: ",
+            "error: ",
+            "ERROR: ",
+            "#[error(",
+            "pub enum Error",
+            "enum Error",
+        ];
+        
+        let strings = elf_analyzer.extract_strings()?;
+        
+        // Track custom error codes we find
+        let mut custom_error_code = 6000; // Anchor custom errors typically start at 6000
+        
+        for string in strings {
+            // Check for error definition patterns
+            for pattern in &error_patterns {
+                if string.contains(pattern) {
+                    // Extract error name
+                    let error_name = if string.contains("#[error(") {
+                        // Parse error attribute format: #[error("error message")]
+                        if let Some(start) = string.find("#[error(\"") {
+                            if let Some(end) = string[start + 9..].find("\"") {
+                                string[start + 9..start + 9 + end].to_string()
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    } else if string.starts_with("Error: ") || string.starts_with("error: ") || string.starts_with("ERROR: ") {
+                        // Simple error message format
+                        let prefix_len = if string.starts_with("ERROR: ") { 7 } else { 7 };
+                        string[prefix_len..].trim().to_string()
+                    } else if string.contains("enum Error") {
+                        // This is likely an error enum definition
+                        // We'd need to parse the enum variants, but for now just note it
+                        "CustomError".to_string()
+                    } else {
+                        continue;
+                    };
+                    
+                    // Add to our error codes if not already present
+                    if !error_name.is_empty() && !error_codes.values().any(|v| v == &error_name) {
+                        error_codes.insert(custom_error_code, error_name);
+                        custom_error_code += 1;
+                    }
+                    
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Look for error code constants in the text section
+    if let Ok(Some(text)) = elf_analyzer.get_text_section() {
+        // Parse instructions to find error code loading
+        if let Ok(instructions) = crate::analyzer::bytecode::parser::parse_instructions(&text_section.data, text_section.address as usize) {
+            for window in instructions.windows(2) {
+                // Look for pattern: load immediate value followed by comparison or function call
+                // This often indicates an error code being used
+                if window[0].is_mov_imm() && window[0].imm >= 6000 && window[0].imm < 7000 {
+                    // This is likely a custom error code in the Anchor range
+                    let error_code = window[0].imm as u32;
+                    
+                    // If we don't already have this code, add it with a generic name
+                    if !error_codes.contains_key(&error_code) {
+                        error_codes.insert(error_code, format!("CustomError{}", error_code - 6000));
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(error_codes)
 } 

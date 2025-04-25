@@ -2,7 +2,6 @@
 
 use anyhow::{Result, anyhow, Context};
 use goblin::elf::{Elf, header::{EM_BPF, ET_DYN, ET_EXEC}, section_header::*};
-use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;

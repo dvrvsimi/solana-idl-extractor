@@ -4,10 +4,14 @@
 // - instruction discriminators: first 8 bytes of sha256("global:<namespace>")
 // - account discriminators: first 8 bytes of sha256("account:<account_name>")
 
-/// Anchor discriminator namespace prefixes
-pub const ANCHOR_DISCRIMINATOR_NAMESPACE: &str = "global:";
-pub const ANCHOR_ACCOUNT_NAMESPACE: &str = "account:";
+/// Length of an Anchor discriminator in bytes
 pub const ANCHOR_DISCRIMINATOR_LENGTH: usize = 8;
+
+/// Namespace for Anchor instruction discriminators
+pub const ANCHOR_DISCRIMINATOR_NAMESPACE: &str = "global:";
+
+/// Namespace for Anchor account discriminators
+pub const ANCHOR_ACCOUNT_NAMESPACE: &str = "account:";
 
 /// Common Anchor Program Discriminators
 pub mod anchor {
