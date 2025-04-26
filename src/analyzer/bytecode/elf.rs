@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use log::{debug, info, warn};
 
 /// ELF section information
 #[derive(Debug, Clone)]
@@ -44,14 +45,14 @@ pub struct ElfSymbol {
 }
 
 /// ELF analyzer for Solana programs
-pub struct ElfAnalyzer<'a> {
+pub struct ElfAnalyzer {
     /// Parsed ELF file
-    elf: Elf<'a>,
+    elf: Box<Elf<'static>>,
     /// Raw binary data
-    data: &'a [u8],
+    data: Vec<u8>,
 }
 
-impl<'a> ElfAnalyzer<'a> {
+impl ElfAnalyzer {
     /// Create a new ELF analyzer from a file path
     pub fn from_file(path: &Path) -> Result<Self> {
         let mut file = File::open(path)
@@ -61,25 +62,31 @@ impl<'a> ElfAnalyzer<'a> {
         file.read_to_end(&mut buffer)
             .context("Failed to read ELF file")?;
         
-        Self::from_bytes(&buffer)
+        Self::from_bytes(buffer)
     }
     
     /// Create a new ELF analyzer from bytes
-    pub fn from_bytes(data: &'a [u8]) -> Result<Self> {
-        let elf = Elf::parse(data)
-            .context("Failed to parse ELF file")?;
-        
-        // Validate that this is a BPF ELF file
-        if elf.header.e_machine != EM_BPF {
-            warn!("ELF file is not a BPF program (machine type: {})", elf.header.e_machine);
-        }
-        
-        if elf.header.e_type != ET_EXEC && elf.header.e_type != ET_DYN {
-            warn!("ELF file is not an executable or shared object (type: {})", elf.header.e_type);
-        }
-        
-        Ok(Self { elf, data })
+    // Update the from_bytes method to use unsafe transmute for the lifetime
+pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+    let elf_ref = Elf::parse(&data)
+        .context("Failed to parse ELF file")?;
+    
+    // Use unsafe to convert the lifetime
+    let elf = unsafe {
+        std::mem::transmute::<Elf, Elf<'static>>(elf_ref)
+    };
+    
+    // Validate that this is a BPF ELF file
+    if elf.header.e_machine != EM_BPF {
+        warn!("ELF file is not a BPF program (machine type: {})", elf.header.e_machine);
     }
+    
+    if elf.header.e_type != ET_EXEC && elf.header.e_type != ET_DYN {
+        warn!("ELF file is not an executable or shared object (type: {})", elf.header.e_type);
+    }
+    
+    Ok(Self { elf: Box::new(elf), data })
+}
     
     /// Get all sections in the ELF file
     pub fn get_sections(&self) -> Result<Vec<ElfSection>> {
@@ -159,7 +166,7 @@ impl<'a> ElfAnalyzer<'a> {
                 sym_type: sym.st_type(),
                 binding: sym.st_bind(),
                 visibility: sym.st_visibility(),
-                section_index: sym.st_shndx,
+                section_index: sym.st_shndx as u16,
             });
         }
         
@@ -255,7 +262,7 @@ pub fn find_pattern(data: &[u8], pattern: &[u8]) -> bool {
 
 /// Parse an ELF file and extract sections
 pub fn parse_elf(data: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
-    let analyzer = ElfAnalyzer::from_bytes(data)?;
+    let analyzer = ElfAnalyzer::from_bytes(data.to_vec())?;
     let sections = analyzer.get_sections()?;
     
     let mut result = HashMap::new();

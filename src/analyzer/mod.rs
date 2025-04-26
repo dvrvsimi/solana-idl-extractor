@@ -11,6 +11,7 @@ mod tests;
 use anyhow::Result;
 use solana_pubkey::Pubkey;
 use log::{info, warn};
+use solana_client::rpc_client::RpcClient;
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
@@ -47,6 +48,7 @@ impl Analyzer {
         
         // Analyze patterns
         patterns::analyze(program_id, &transactions)
+        .map_err(|e| anyhow::anyhow!("{}", e))
     }
     
     /// Build IDL from analyses

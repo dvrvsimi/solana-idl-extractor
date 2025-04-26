@@ -48,11 +48,11 @@ pub fn is_anchor_program(program_data: &[u8]) -> bool {
     
     // Method 4: Check for Anchor error codes
     // Many Anchor programs contain these specific error codes
-    let error_code_patterns = [
+    let error_code_patterns: [&[u8]; 2] = [
         // ConstraintMut (2000)
-        0xd0, 0x07, 0x00, 0x00,
+        &[0xd0, 0x07, 0x00, 0x00],
         // AccountDiscriminatorNotFound (3001)
-        0xb9, 0x0b, 0x00, 0x00,
+        &[0xb9, 0x0b, 0x00, 0x00],
     ];
     
     for pattern in &error_code_patterns {
@@ -174,7 +174,7 @@ pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, St
     let mut error_codes = crate::constants::anchor::error_codes();
     
     // Try to parse the ELF file
-    let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data)?;
+    let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data.to_vec())?;
     
     // Extract strings from the rodata section
     if let Ok(Some(rodata)) = elf_analyzer.get_rodata_section() {
@@ -236,7 +236,7 @@ pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, St
     // Look for error code constants in the text section
     if let Ok(Some(text)) = elf_analyzer.get_text_section() {
         // Parse instructions to find error code loading
-        if let Ok(instructions) = crate::analyzer::bytecode::parser::parse_instructions(&text_section.data, text_section.address as usize) {
+        if let Ok(instructions) = crate::analyzer::bytecode::parser::parse_instructions(&text.data, text.address as usize) {
             for window in instructions.windows(2) {
                 // Look for pattern: load immediate value followed by comparison or function call
                 // This often indicates an error code being used

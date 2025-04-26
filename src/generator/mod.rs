@@ -68,7 +68,7 @@ pub fn generate_typescript(idl: &IDL) -> Result<String> {
     // Add instruction enum
     ts_code.push_str("export enum Instructions {\n");
     for instruction in &idl.instructions {
-        ts_code.push_str(&format!("  {} = {},\n", instruction.name, instruction.code));
+        ts_code.push_str(&format!("  {} = {},\n", instruction.name, instruction.index));
     }
     ts_code.push_str("}\n\n");
     
@@ -95,7 +95,7 @@ pub fn generate_typescript(idl: &IDL) -> Result<String> {
         // Add parameters
         let mut params = Vec::new();
         for arg in &instruction.args {
-            params.push(format!("{}: {}", arg.name, ts_type_for_rust_type(&arg.type_name)));
+            params.push(format!("{}: {}", arg.name, ts_type_for_rust_type(&arg.ty)));
         }
         
         // Add accounts parameter
@@ -107,7 +107,7 @@ pub fn generate_typescript(idl: &IDL) -> Result<String> {
         
         // Method implementation
         ts_code.push_str("    // Create instruction data\n");
-        ts_code.push_str(&format!("    const data = Buffer.from([{}]);\n", instruction.code));
+        ts_code.push_str(&format!("    const data = Buffer.from([{}]);\n", instruction.index));
         
         ts_code.push_str("    // Create transaction\n");
         ts_code.push_str("    const instruction = new web3.TransactionInstruction({\n");

@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use crate::analyzer::bytecode::parser::SbfInstruction;
 use crate::analyzer::bytecode::cfg::{BasicBlock, Function};
-use crate::constants::{opcodes, syscalls};
+use crate::constants::opcodes::opcodes;
+use crate::constants::syscalls::syscalls;
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 
@@ -27,25 +28,22 @@ pub struct InstructionHandler {
 /// Extract strings from .rodata section
 pub fn extract_strings(data: &[u8]) -> Vec<String> {
     let mut strings = Vec::new();
-    let mut start = 0;
+    let mut current_string = Vec::new();
     
-    while start < data.len() {
-        // Find the next null terminator
-        if let Some(end) = data[start..].iter().position(|&b| b == 0) {
-            if end > 0 {
-                // Extract the string
-                if let Ok(s) = std::str::from_utf8(&data[start..start + end]) {
-                    if s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
-                        strings.push(s.to_string());
+    for &byte in data {
+        if byte == 0 {
+            if !current_string.is_empty() {
+                if let Ok(s) = String::from_utf8(current_string) {
+                    if s.len() >= 3 && s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                        strings.push(s);
                     }
                 }
+                current_string = Vec::new();
             }
-            
-            // Move past the null terminator
-            start += end + 1;
+        } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+            current_string.push(byte);
         } else {
-            // No more null terminators
-            break;
+            current_string.clear();
         }
     }
     

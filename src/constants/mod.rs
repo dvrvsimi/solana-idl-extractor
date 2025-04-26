@@ -1,5 +1,8 @@
-//! Constants used throughout the application
+//! Constants used throughout the extractor
 
-pub mod anchor;
+pub mod opcodes;
 pub mod syscalls;
+pub mod anchor;
+
+/// Discriminator constants
 pub mod discriminator;

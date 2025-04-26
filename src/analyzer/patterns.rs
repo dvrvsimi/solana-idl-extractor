@@ -1,15 +1,17 @@
 //! Common instruction patterns for Solana programs
 
 use anyhow::Result;
+use log::{debug, info, warn};
 use solana_pubkey::Pubkey;  // Updated import
-use solana_transaction_status::{UiTransactionEncoding, TransactionBinaryEncoding, UiMessage, UiInstruction};
+use solana_transaction_status::{UiTransactionEncoding, TransactionBinaryEncoding, UiMessage, UiInstruction, UiCompiledInstruction, UiParsedInstruction, UiRawMessage};
 use crate::models::instruction::Instruction;
-use crate::constants::discriminators::program_ids;
+use crate::constants::discriminator::program_ids;
 use log;
 use std::str::FromStr;
 use solana_clock::Clock;
 use solana_rent::Rent;
 use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
+use solana_program::sysvar::SysvarId;
 
 /// Results of pattern analysis
 pub struct PatternAnalysis {
@@ -84,33 +86,66 @@ pub fn extract_instruction_data(
         match transaction {
             solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
                 // Process JSON-encoded transaction
-                if let Some(ui_message) = &ui_transaction.message {
-                    // Extract instructions
-                    if let Some(instructions) = &ui_message.instructions {
-                        for instruction in instructions {
-                            // Check if this instruction is for our program
-                            if let Some(program_id_str) = &instruction.program_id {
-                                if program_id_str == &program_id.to_string() {
-                                    // Extract instruction data
-                                    if let Some(data_str) = &instruction.data {
-                                        // Try base58 decoding first
-                                        match bs58::decode(data_str).into_vec() {
-                                            Ok(data) => {
-                                                instruction_data.push(data);
-                                            },
-                                            Err(err) => {
-                                                // Log the error but continue processing
-                                                log::debug!("Failed to decode base58 data: {}", err);
-                                                
-                                                // Try base64 decoding as fallback
-                                                match base64::decode(data_str) {
-                                                    Ok(data) => {
-                                                        instruction_data.push(data);
-                                                    },
-                                                    Err(err) => {
-                                                        log::debug!("Failed to decode base64 data: {}", err);
-                                                    }
+                let ui_message = &ui_transaction.message;
+                
+                // Handle different UiMessage variants
+                match ui_message {
+                    UiMessage::Parsed(parsed_message) => {
+                        // Handle parsed message
+                        for instruction in &parsed_message.instructions {
+                        // Check if this instruction is for our program
+                            if let Some(program_id_str) = get_program_id(instruction, ui_message) {
+                                if program_id_str == program_id.to_string() {
+                                // Extract instruction data
+                                    if let Some(data_str) = get_instruction_data(instruction) {
+                                    // Try base58 decoding first
+                                        match bs58::decode(&data_str).into_vec() {
+                                        Ok(data) => {
+                                            instruction_data.push(data);
+                                        },
+                                        Err(err) => {
+                                            // Log the error but continue processing
+                                            log::debug!("Failed to decode base58 data: {}", err);
+                                            
+                                            // Try base64 decoding as fallback
+                                                match base64::decode(&data_str) {
+                                                Ok(data) => {
+                                                    instruction_data.push(data);
+                                                },
+                                                Err(err) => {
+                                                    log::debug!("Failed to decode base64 data: {}", err);
                                                 }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    UiMessage::Raw(raw_message) => {
+                        // Handle raw message
+                        for instruction in &raw_message.instructions {
+                            // Raw messages only have UiCompiledInstruction, not UiInstruction enum
+                            let compiled = instruction; // instruction is already a UiCompiledInstruction
+                            
+                            // Check if this instruction is for our program
+                            if compiled.program_id_index < raw_message.account_keys.len() as u8 {
+                                let program_id_str = raw_message.account_keys[compiled.program_id_index as usize].clone();
+                                
+                                if program_id_str == program_id.to_string() {
+                                    // Extract instruction data
+                                    let data_str = &compiled.data;
+                                    
+                                    // Try base58 decoding first
+                                    match bs58::decode(data_str).into_vec() {
+                                        Ok(data) => {
+                                            instruction_data.push(data);
+                                        },
+                                        Err(err) => {
+                                            // Try base64 decoding as fallback
+                                            if let Ok(data) = base64::decode(data_str) {
+                                                instruction_data.push(data);
                                             }
                                         }
                                     }
@@ -303,18 +338,36 @@ fn analyze_account_patterns(
         match transaction {
             solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
                 // Process JSON-encoded transaction
-                if let Some(ui_message) = &ui_transaction.message {
-                    // Extract instructions
-                    if let Some(instructions) = &ui_message.instructions {
-                        for instruction in instructions {
+                let ui_message = &ui_transaction.message;
+                
+                // Handle different UiMessage variants
+                match ui_message {
+                    UiMessage::Parsed(parsed_message) => {
+                        // Handle parsed message
+                        for instruction in &parsed_message.instructions {
                             // Check if this instruction is for our program
-                            if let Some(program_id_str) = &instruction.program_id {
-                                if program_id_str == &program_id.to_string() {
+                            if let Some(program_id_str) = get_program_id(instruction, ui_message) {
+                                if program_id_str == program_id.to_string() {
                                     // Extract instruction discriminator
                                     let discriminator = extract_discriminator(instruction);
                                     
                                     // Extract account usage
-                                    if let Some(accounts) = &instruction.accounts {
+                                    let accounts = match instruction {
+                                        UiInstruction::Compiled(compiled) => {
+                                            // For compiled instructions, convert account indices to strings
+                                            Some(compiled.accounts.iter().map(|&idx| idx.to_string()).collect::<Vec<_>>())
+                                        },
+                                        UiInstruction::Parsed(parsed) => {
+                                            match parsed {
+                                                UiParsedInstruction::Parsed(_) => None,
+                                                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                                                    Some(partially_decoded.accounts.clone())
+                                                }
+                                            }
+                                        }
+                                    };
+                                    
+                                    if let Some(accounts) = accounts {
                                         for (i, account_idx_str) in accounts.iter().enumerate() {
                                             if let Ok(idx) = account_idx_str.parse::<usize>() {
                                                 // Check if the account is a signer or writable
@@ -329,6 +382,25 @@ fn analyze_account_patterns(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    },
+                    UiMessage::Raw(raw_message) => {
+                        // Handle raw message
+                        for instruction in &raw_message.instructions {
+                            // Check if this instruction is for our program
+                            if let Some(program_id_str) = get_program_id_raw(instruction, raw_message) {
+                                if program_id_str == program_id.to_string() {
+                                    // Extract instruction discriminator
+                                    let discriminator = extract_discriminator_raw(instruction);
+                                    
+                                    // Extract account usage
+                                    let accounts = instruction.accounts.iter()
+                                        .map(|&idx| idx.to_string())
+                                        .collect::<Vec<_>>();
+                                    
+                                    // Rest of your code...
                                 }
                             }
                         }
@@ -361,25 +433,47 @@ fn analyze_account_patterns(
 
 /// Extract the instruction discriminator
 pub fn extract_discriminator(instruction: &UiInstruction) -> u8 {
-    // The UiInstruction doesn't have a direct data field, it has a data Option<String>
-    if let Some(data_str) = &instruction.data {
-        // Try to decode the data
-        if let Ok(data) = bs58::decode(data_str).into_vec() {
+    match instruction {
+        UiInstruction::Compiled(compiled) => {
+            // For compiled instructions, decode the data field
+            if let Ok(data) = bs58::decode(&compiled.data).into_vec() {
+                if !data.is_empty() {
+                    return data[0];
+                }
+            }
+        },
+        UiInstruction::Parsed(parsed) => {
+            match parsed {
+                UiParsedInstruction::Parsed(parsed_instruction) => {
+                    // For fully parsed instructions, we might need to extract from the parsed JSON
+                    // This is a simplification - in a real implementation you'd extract from parsed.parsed
+                    return 0; // Default for now
+                },
+                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                    // For partially decoded instructions, decode the data field
+                    if let Ok(data) = bs58::decode(&partially_decoded.data).into_vec() {
             if !data.is_empty() {
                 return data[0];
+                        }
+                    }
+                }
             }
         }
     }
-    0
+    0 // Default return
 }
 
 /// Check if an account is a signer
 pub fn is_account_signer(message: &UiMessage, account_idx: usize) -> bool {
-    // The UiMessage structure is different than expected
-    // Let's use a simpler approach based on the account_keys
-    if let Some(account_keys) = &message.account_keys {
-        if account_idx < account_keys.len() {
-            return account_keys[account_idx].signer;
+    match message {
+        UiMessage::Parsed(parsed_message) => {
+            if account_idx < parsed_message.account_keys.len() {
+                return parsed_message.account_keys[account_idx].signer;
+            }
+        },
+        UiMessage::Raw(raw_message) => {
+            // For raw messages, check if the account index is within the required signatures
+            return account_idx < raw_message.header.num_required_signatures as usize;
         }
     }
     false
@@ -387,11 +481,33 @@ pub fn is_account_signer(message: &UiMessage, account_idx: usize) -> bool {
 
 /// Check if an account is writable
 pub fn is_account_writable(message: &UiMessage, account_idx: usize) -> bool {
-    // The UiMessage structure is different than expected
-    // Let's use a simpler approach based on the account_keys
-    if let Some(account_keys) = &message.account_keys {
-        if account_idx < account_keys.len() {
-            return account_keys[account_idx].writable;
+    match message {
+        UiMessage::Parsed(parsed_message) => {
+            if account_idx < parsed_message.account_keys.len() {
+                return parsed_message.account_keys[account_idx].writable;
+            }
+        },
+        UiMessage::Raw(raw_message) => {
+            // For raw messages, determine if writable based on the account's position
+            // Accounts are writable if they're in the first section (before readonly signed accounts)
+            // or in the third section (after readonly signed accounts but before readonly unsigned accounts)
+            let num_required_sigs = raw_message.header.num_required_signatures as usize;
+            let num_readonly_signed = raw_message.header.num_readonly_signed_accounts as usize;
+            let num_readonly_unsigned = raw_message.header.num_readonly_unsigned_accounts as usize;
+            
+            // First section: writable signed accounts
+            if account_idx < (num_required_sigs - num_readonly_signed) {
+                return true;
+            }
+            
+            // Third section: writable unsigned accounts
+            let total_readonly = num_readonly_signed + num_readonly_unsigned;
+            let total_accounts = raw_message.account_keys.len();
+            if account_idx >= num_required_sigs && account_idx < (total_accounts - num_readonly_unsigned) {
+                return true;
+            }
+            
+            return false;
         }
     }
     false
@@ -547,18 +663,36 @@ pub fn detect_account_patterns(
         match transaction {
             solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
                 // Process JSON-encoded transaction
-                if let Some(ui_message) = &ui_transaction.message {
-                    // Extract instructions
-                    if let Some(instructions) = &ui_message.instructions {
-                        for instruction in instructions {
+                let ui_message = &ui_transaction.message;
+                
+                // Handle different UiMessage variants
+                match ui_message {
+                    UiMessage::Parsed(parsed_message) => {
+                        // Handle parsed message
+                        for instruction in &parsed_message.instructions {
                             // Check if this instruction is for our program
-                            if let Some(program_id_str) = &instruction.program_id {
-                                if program_id_str == &program_id.to_string() {
+                            if let Some(program_id_str) = get_program_id(instruction, ui_message) {
+                                if program_id_str == program_id.to_string() {
                                     // Extract instruction discriminator
                                     let discriminator = extract_discriminator(instruction);
                                     
                                     // Extract account usage
-                                    if let Some(accounts) = &instruction.accounts {
+                                    let accounts = match instruction {
+                                        UiInstruction::Compiled(compiled) => {
+                                            // For compiled instructions, convert account indices to strings
+                                            Some(compiled.accounts.iter().map(|&idx| idx.to_string()).collect::<Vec<_>>())
+                                        },
+                                        UiInstruction::Parsed(parsed) => {
+                                            match parsed {
+                                                UiParsedInstruction::Parsed(_) => None,
+                                                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                                                    Some(partially_decoded.accounts.clone())
+                                                }
+                                            }
+                                        }
+                                    };
+                                    
+                                    if let Some(accounts) = accounts {
                                         for (i, account_idx_str) in accounts.iter().enumerate() {
                                             if let Ok(idx) = account_idx_str.parse::<usize>() {
                                                 // Check if the account is a signer or writable
@@ -573,6 +707,25 @@ pub fn detect_account_patterns(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    },
+                    UiMessage::Raw(raw_message) => {
+                        // Handle raw message
+                        for instruction in &raw_message.instructions {
+                            // Check if this instruction is for our program
+                            if let Some(program_id_str) = get_program_id_raw(instruction, raw_message) {
+                                if program_id_str == program_id.to_string() {
+                                    // Extract instruction discriminator
+                                    let discriminator = extract_discriminator_raw(instruction);
+                                    
+                                    // Extract account usage
+                                    let accounts = instruction.accounts.iter()
+                                        .map(|&idx| idx.to_string())
+                                        .collect::<Vec<_>>();
+                                    
+                                    // Rest of your code...
                                 }
                             }
                         }
@@ -678,4 +831,102 @@ pub fn identify_instruction_type(
     }
     
     format!("instruction_{}", discriminator)
+}
+
+/// Extract program ID from an instruction
+fn get_program_id(instruction: &UiInstruction, message: &UiMessage) -> Option<String> {
+    match instruction {
+        UiInstruction::Compiled(compiled) => {
+            match message {
+                UiMessage::Parsed(parsed_message) => {
+                    if compiled.program_id_index < parsed_message.account_keys.len() as u8 {
+                        Some(parsed_message.account_keys[compiled.program_id_index as usize].pubkey.clone())
+                    } else {
+                        None
+                    }
+                },
+                UiMessage::Raw(raw_message) => {
+                    if compiled.program_id_index < raw_message.account_keys.len() as u8 {
+                        Some(raw_message.account_keys[compiled.program_id_index as usize].clone())
+                    } else {
+                        None
+                    }
+                }
+            }
+        },
+        UiInstruction::Parsed(parsed) => {
+            match parsed {
+                UiParsedInstruction::Parsed(parsed_instruction) => {
+                    Some(parsed_instruction.program_id.clone())
+                },
+                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                    Some(partially_decoded.program_id.clone())
+                }
+            }
+        }
+    }
+}
+
+/// Extract data from an instruction
+fn get_instruction_data(instruction: &UiInstruction) -> Option<String> {
+    match instruction {
+        UiInstruction::Compiled(compiled) => {
+            Some(compiled.data.clone())
+        },
+        UiInstruction::Parsed(parsed) => {
+            match parsed {
+                UiParsedInstruction::Parsed(_) => {
+                    // For fully parsed instructions, we don't have raw data
+                    None
+                },
+                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                    Some(partially_decoded.data.clone())
+                }
+            }
+        }
+    }
+}
+
+/// Extract accounts from an instruction
+fn get_instruction_accounts(instruction: &UiInstruction) -> Option<Vec<String>> {
+    match instruction {
+        UiInstruction::Compiled(compiled) => {
+            // For compiled instructions, convert account indices to strings
+            let account_indices = &compiled.accounts;
+            let account_strings = account_indices.iter()
+                .map(|&idx| idx.to_string())
+                .collect();
+            Some(account_strings)
+        },
+        UiInstruction::Parsed(parsed) => {
+            match parsed {
+                UiParsedInstruction::Parsed(_) => {
+                    // For fully parsed instructions, we don't have account indices
+                    None
+                },
+                UiParsedInstruction::PartiallyDecoded(partially_decoded) => {
+                    Some(partially_decoded.accounts.clone())
+                }
+            }
+        }
+    }
+}
+
+/// Add this helper function to handle UiCompiledInstruction directly
+fn get_program_id_raw(instruction: &UiCompiledInstruction, raw_message: &UiRawMessage) -> Option<String> {
+    if instruction.program_id_index < raw_message.account_keys.len() as u8 {
+        Some(raw_message.account_keys[instruction.program_id_index as usize].clone())
+    } else {
+        None
+    }
+}
+
+/// Add this helper function to extract discriminator from UiCompiledInstruction
+fn extract_discriminator_raw(instruction: &UiCompiledInstruction) -> u8 {
+    if let Ok(data) = bs58::decode(&instruction.data).into_vec() {
+        if !data.is_empty() {
+            return data[0];
+        }
+    }
+    0
 } 

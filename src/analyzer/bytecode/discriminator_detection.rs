@@ -36,7 +36,7 @@ pub fn extract_discriminators(program_data: &[u8]) -> Result<Vec<AnchorDiscrimin
     let mut discriminators = Vec::new();
     
     // Try to parse the ELF file
-    let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data)?;
+    let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data.to_vec())?;
     
     // Get the text section (code)
     if let Ok(Some(text_section)) = elf_analyzer.get_text_section() {

@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
 use crate::models::account::Account;
-use crate::constants::discriminator::ANCHOR_DISCRIMINATOR_LENGTH;
 use super::parser::{SbfInstruction, parse_instructions};
 use super::elf::ElfAnalyzer;
 
@@ -40,7 +39,7 @@ pub fn extract_account_structures(program_data: &[u8]) -> Result<Vec<Account>> {
     let mut memory_patterns: HashMap<u8, MemoryAccessPattern> = HashMap::new();
     
     // Try to parse the ELF file
-    let elf_analyzer = ElfAnalyzer::from_bytes(program_data)?;
+    let elf_analyzer = ElfAnalyzer::from_bytes(program_data.to_vec())?;
     
     // Get the text section (code)
     if let Ok(Some(text_section)) = elf_analyzer.get_text_section() {
@@ -56,16 +55,16 @@ pub fn extract_account_structures(program_data: &[u8]) -> Result<Vec<Account>> {
             if insn.is_mov_imm() {
                 register_values.insert(insn.dst_reg, ("immediate".to_string(), insn.imm as usize));
             } else if insn.is_mov_reg() {
-                if let Some(&(source, offset)) = register_values.get(&insn.src_reg) {
+                if let Some((source, offset)) = register_values.get(&insn.src_reg).cloned() {
                     register_values.insert(insn.dst_reg, (source, offset));
                 }
             } else if insn.is_add_imm() {
-                if let Some(&(source, offset)) = register_values.get(&insn.dst_reg) {
+                if let Some((source, offset)) = register_values.get(&insn.dst_reg).cloned() {
                     register_values.insert(insn.dst_reg, (source, offset + insn.imm as usize));
                 }
             } else if insn.is_add_reg() {
-                if let Some(&(source1, offset1)) = register_values.get(&insn.dst_reg) {
-                    if let Some(&(source2, offset2)) = register_values.get(&insn.src_reg) {
+                if let Some((source1, offset1)) = register_values.get(&insn.dst_reg).cloned() {
+                    if let Some((source2, offset2)) = register_values.get(&insn.src_reg).cloned() {
                         register_values.insert(insn.dst_reg, (format!("{}+{}", source1, source2), offset1 + offset2));
                     }
                 }

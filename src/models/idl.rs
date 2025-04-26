@@ -5,9 +5,10 @@ use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::analyzer::patterns_simplified::PatternAnalysis;
 use crate::monitor::transaction::TransactionAnalysis;
+use crate::models::transaction_pattern::TransactionPattern;
 
 /// Interface Description Language (IDL) for a Solana program
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IDL {
     /// Program name
     pub name: String,
@@ -26,7 +27,7 @@ pub struct IDL {
 }
 
 /// Error definition
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Error {
     /// Error code
     pub code: u32,
@@ -37,7 +38,7 @@ pub struct Error {
 }
 
 /// Program metadata
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Metadata {
     /// Program address
     pub address: String,

@@ -15,8 +15,9 @@ use solana_instruction::Instruction;
 use solana_instruction::account_meta::AccountMeta;
 use solana_message::Message;
 use solana_transaction::Transaction;
-use solana_signature::keypair::Keypair;
-use solana_signature::signature::Signer;
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+use solana_hash::Hash;
 
 use crate::models::idl::IDL;
 use crate::models::instruction::Instruction as IdlInstruction;
@@ -189,7 +190,7 @@ impl TransactionSimulator {
         // Sign the transaction
         let recent_blockhash = self.get_recent_blockhash().await
             .map_err(|e| ExtractorError::Simulation(format!("Failed to get recent blockhash: {}", e)))?;
-        tx.sign(&[&self.payer], recent_blockhash);
+        tx.sign(&[&self.payer], Hash::new(&recent_blockhash));
         
         // Simulate the transaction with retry logic
         let result = self.simulate_transaction_with_retry(&tx, 3).await
@@ -314,12 +315,12 @@ impl TransactionSimulator {
             data.extend_from_slice(&discriminator);
         } else {
             // For non-Anchor programs, add instruction code
-            data.push(instruction.code);
+            data.push(instruction.index);
         }
         
         // Add mock data for each argument
         for arg in &instruction.args {
-            match arg.type_name.as_str() {
+            match arg.ty.as_str() {
                 "u8" => data.push(1),
                 "u16" => data.extend_from_slice(&1u16.to_le_bytes()),
                 "u32" => data.extend_from_slice(&1u32.to_le_bytes()),
@@ -528,18 +529,18 @@ impl TransactionSimulator {
                                     // Try to infer better type from value
                                     if value.starts_with("0x") {
                                         // Likely a pubkey
-                                        instruction.args[i].type_name = "Pubkey".to_string();
+                                        instruction.args[i].ty = "Pubkey".to_string();
                                     } else if value == "true" || value == "false" {
-                                        instruction.args[i].type_name = "bool".to_string();
+                                        instruction.args[i].ty = "bool".to_string();
                                     } else if value.parse::<u64>().is_ok() {
                                         // Numeric value, keep existing type or default to u64
                                         if !["u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64"]
-                                            .contains(&instruction.args[i].type_name.as_str()) {
-                                            instruction.args[i].type_name = "u64".to_string();
+                                            .contains(&instruction.args[i].ty.as_str()) {
+                                            instruction.args[i].ty = "u64".to_string();
                                         }
                                     } else {
                                         // Likely a string
-                                        instruction.args[i].type_name = "string".to_string();
+                                        instruction.args[i].ty = "string".to_string();
                                     }
                                 }
                             }

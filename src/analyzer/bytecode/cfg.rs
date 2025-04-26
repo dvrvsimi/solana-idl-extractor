@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 use crate::analyzer::bytecode::parser::SbfInstruction;
+use std::collections::{HashSet, VecDeque};
+use crate::constants::opcodes::opcodes;
 
 /// Basic block in the control flow graph
 #[derive(Debug, Clone)]
@@ -161,6 +163,9 @@ pub fn build_cfg(instructions: &[SbfInstruction]) -> Result<(Vec<BasicBlock>, Ve
     }
     
     // Connect blocks (add successors and predecessors)
+    // First, collect all the connections we need to make
+    let mut connections = Vec::new();
+
     for i in 0..blocks.len() {
         let block = &blocks[i];
         
@@ -175,21 +180,24 @@ pub fn build_cfg(instructions: &[SbfInstruction]) -> Result<(Vec<BasicBlock>, Ve
             if let Some(target) = last_insn.branch_target() {
                 // Find block containing this target
                 if let Some(target_block) = blocks.iter().position(|b| b.start <= target && target <= b.end) {
-                    blocks[i].successors.push(target_block);
-                    blocks[target_block].predecessors.push(i);
+                    connections.push((i, target_block));
                 }
             }
             
             // For conditional branches, the next block is also a successor
             if last_insn.is_conditional_branch() && i + 1 < blocks.len() {
-                blocks[i].successors.push(i + 1);
-                blocks[i + 1].predecessors.push(i);
+                connections.push((i, i + 1));
             }
         } else if !last_insn.is_return() && !last_insn.is_exit() && i + 1 < blocks.len() {
             // If not a branch or return, the next block is a successor
-            blocks[i].successors.push(i + 1);
-            blocks[i + 1].predecessors.push(i);
+            connections.push((i, i + 1));
         }
+    }
+
+    // Now apply all the connections
+    for (from, to) in connections {
+        blocks[from].successors.push(to);
+        blocks[to].predecessors.push(from);
     }
     
     // Identify functions
@@ -325,8 +333,8 @@ pub fn find_instruction_dispatch(instructions: &[SbfInstruction]) -> Vec<(usize,
         if window[0].is_load() && 
            window[0].mem_size() == Some(1) && 
            window[0].dst_reg == 0 && 
-           (window[1].opcode == crate::constants::opcodes::JEQ_IMM || 
-            window[1].opcode == crate::constants::opcodes::JNE_IMM) {
+           (window[1].opcode == opcodes::JEQ_IMM || 
+            window[1].opcode == opcodes::JNE_IMM) {
             
             let discriminator = window[1].imm as u8;
             let offset = i;
@@ -347,8 +355,8 @@ pub fn find_byte_comparisons(instructions: &[SbfInstruction]) -> Vec<(usize, u8)
         // Look for a pattern like:
         // jeq r0, <imm>, +12 // Compare and jump if equal
         
-        if (window[0].opcode == crate::constants::opcodes::JEQ_IMM || 
-            window[0].opcode == crate::constants::opcodes::JNE_IMM) {
+        if window[0].opcode == opcodes::JEQ_IMM || 
+            window[0].opcode == opcodes::JNE_IMM {
             let value = window[0].imm as u8;
             let offset = i;
             

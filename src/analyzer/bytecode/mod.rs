@@ -64,7 +64,7 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
     }
     
     // Parse ELF file
-    let elf_analyzer = elf::ElfAnalyzer::from_bytes(program_data)
+    let elf_analyzer = elf::ElfAnalyzer::from_bytes(program_data.to_vec())
         .context("Failed to parse ELF file")?;
     
     // Get the text section
@@ -86,7 +86,10 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
         .context("Failed to extract discriminators")?;
     
     // Extract strings
-    let strings = elf::extract_strings(program_data);
+    let strings = match elf_analyzer.extract_strings() {
+        Ok(s) => s,
+        Err(_) => Vec::new(),
+    };
     
     // Determine if this is an Anchor program
     let is_anchor = !discriminators.is_empty() || 
@@ -108,7 +111,7 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
     let mut idl_instructions = Vec::new();
     
     for function in functions {
-        if let Some(name) = function.name {
+        if let Some(ref name) = function.name {
             if name.starts_with("process_instruction_") {
                 // This is an instruction handler
                 let mut instruction = Instruction::new(
@@ -119,7 +122,7 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
                 // Add parameters from analysis
                 let params = cfg::analyze_instruction_parameters(&blocks, &function);
                 for (name, type_name) in params {
-                    instruction.add_arg(name, type_name);
+                    instruction.add_arg(name.clone(), type_name);
                 }
                 
                 idl_instructions.push(instruction);

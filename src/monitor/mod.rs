@@ -5,7 +5,7 @@ pub mod transaction;
 
 use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 use solana_transaction_status::EncodedTransaction;
 
 pub use self::transaction::TransactionAnalysis;

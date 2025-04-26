@@ -42,6 +42,7 @@ pub mod generator;
 pub mod cache;
 pub mod constants;
 pub mod utils;
+pub mod errors;
 
 use std::path::Path;
 use anyhow::{Result, Context};

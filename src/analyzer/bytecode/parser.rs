@@ -7,7 +7,7 @@
 use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
 use std::collections::HashMap;
-use crate::constants::opcodes;
+use crate::constants::opcodes::opcodes;
 use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
 
 /// SBPF version
@@ -197,6 +197,71 @@ impl SbfInstruction {
         self.version == SbpfVersion::V3 && 
         self.opcode == 0x85 &&
         self.imm >= 0x100000
+    }
+    
+    pub fn is_load_imm(&self) -> bool {
+        self.opcode == opcodes::LDDW
+    }
+    
+    pub fn is_mov_reg(&self) -> bool {
+        self.opcode == opcodes::MOV64_REG
+    }
+    
+    pub fn is_add_imm(&self) -> bool {
+        self.opcode == opcodes::ADD64_IMM
+    }
+
+    pub fn is_add_reg(&self) -> bool {
+        self.opcode == opcodes::ADD64_REG
+    }
+    
+    pub fn is_cmp(&self) -> bool {
+        self.opcode == opcodes::JEQ_REG ||
+        self.opcode == opcodes::JNE_REG
+    }
+    
+    pub fn is_branch(&self) -> bool {
+        self.opcode == opcodes::JA ||
+        self.opcode == opcodes::JEQ_IMM ||
+        self.opcode == opcodes::JNE_IMM ||
+        self.opcode == opcodes::JEQ_REG ||
+        self.opcode == opcodes::JNE_REG
+    }
+    
+    pub fn is_conditional_branch(&self) -> bool {
+        self.opcode == opcodes::JEQ_IMM ||
+        self.opcode == opcodes::JNE_IMM ||
+        self.opcode == opcodes::JEQ_REG ||
+        self.opcode == opcodes::JNE_REG
+    }
+    
+    pub fn is_return(&self) -> bool {
+        self.opcode == opcodes::EXIT
+    }
+    
+    pub fn branch_target(&self) -> Option<usize> {
+        if self.is_branch() {
+            Some((self.offset as isize + self.imm as isize) as usize)
+        } else {
+            None
+        }
+    }
+    
+    pub fn call_target(&self) -> Option<usize> {
+        if self.opcode == opcodes::CALL {
+            Some((self.offset as isize + self.imm as isize) as usize)
+        } else {
+            None
+        }
+    }
+    
+    pub fn is_mov_imm(&self) -> bool {
+        self.opcode == opcodes::MOV64_IMM
+    }
+    
+    pub fn is_cmp_imm(&self) -> bool {
+        self.opcode == opcodes::JEQ_IMM ||
+        self.opcode == opcodes::JNE_IMM
     }
 }
 

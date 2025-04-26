@@ -354,7 +354,7 @@ fn extract_from_v0_message(message: &MessageV0) -> ExtractorResult<(Vec<u8>, Vec
             
             // Determine if signer and writable with safer checks
             let is_signer = account_idx < message.header.num_required_signatures as usize;
-            let is_writable = message.is_writable(account_idx, program_idx);
+            let is_writable = message.is_maybe_writable(account_idx, None);
             
             if is_writable {
                 accounts.push(AccountMeta::new(pubkey, is_signer));
