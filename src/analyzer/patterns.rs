@@ -327,7 +327,7 @@ fn infer_parameter_types(data: &[u8]) -> Vec<String> {
 }
 
 /// Analyze account patterns
-fn analyze_account_patterns(
+pub fn analyze_account_patterns(
     program_id: &Pubkey,
     transactions: &[solana_transaction_status::EncodedTransaction],
 ) -> ExtractorResult<Vec<AccountPattern>> {

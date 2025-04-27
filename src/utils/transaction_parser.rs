@@ -90,11 +90,17 @@ fn try_parse_binary(data: &[u8]) -> ExtractorResult<(Vec<u8>, Vec<AccountMeta>)>
         Err(e) => {
             // If it's not a legacy transaction, try as versioned transaction
             match bincode::deserialize::<VersionedTransaction>(data) {
-                Ok(versioned_tx) => match versioned_tx {
-                    VersionedTransaction::Legacy(tx) => extract_from_legacy_transaction(&tx),
-                    VersionedTransaction::V0(tx) => {
-                        let message = &tx.message;
-                        extract_from_v0_message(message)
+                Ok(versioned_tx) => match versioned_tx.message {
+                    solana_message::VersionedMessage::Legacy(message) => {
+                        // Create a legacy transaction
+                        let tx = Transaction {
+                            signatures: versioned_tx.signatures,
+                            message,
+                        };
+                        extract_from_legacy_transaction(&tx)
+                    },
+                    solana_message::VersionedMessage::V0(message) => {
+                        extract_from_v0_message(&message)
                     },
                 },
                 Err(_) => Err(ExtractorError::TransactionParsing(
@@ -293,7 +299,12 @@ fn extract_from_raw_data(data: &[u8]) -> ExtractorResult<(Vec<u8>, Vec<AccountMe
 fn extract_from_legacy_transaction(tx: &Transaction) -> ExtractorResult<(Vec<u8>, Vec<AccountMeta>)> {
     // Find the first instruction that's not a compute budget instruction
     for instruction in &tx.message.instructions {
-        let program_id = instruction.program_id;
+        // Get program_id using the program_id_index
+        let program_id_index = instruction.program_id_index as usize;
+        if program_id_index >= tx.message.account_keys.len() {
+            continue; // Skip invalid program index
+        }
+        let program_id = tx.message.account_keys[program_id_index];
         
         // Skip compute budget instructions
         if program_id == Pubkey::from_str("ComputeBudget111111111111111111111111111111").unwrap_or_default() {
@@ -304,7 +315,22 @@ fn extract_from_legacy_transaction(tx: &Transaction) -> ExtractorResult<(Vec<u8>
         let data = instruction.data.clone();
         
         // Extract account metas
-        let accounts = instruction.accounts.clone();
+        let mut accounts = Vec::new();
+        for account_idx in &instruction.accounts {
+            let idx = *account_idx as usize;
+            if idx < tx.message.account_keys.len() {
+                let pubkey = tx.message.account_keys[idx];
+                let is_signer = tx.message.is_signer(idx);
+                // Use is_maybe_writable instead of is_writable (which is deprecated)
+                let is_writable = tx.message.is_maybe_writable(idx, None);
+                
+                if is_writable {
+                    accounts.push(AccountMeta::new(pubkey, is_signer));
+                } else {
+                    accounts.push(AccountMeta::new_readonly(pubkey, is_signer));
+                }
+            }
+        }
         
         return Ok((data, accounts));
     }

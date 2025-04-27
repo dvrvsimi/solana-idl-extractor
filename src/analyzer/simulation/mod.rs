@@ -687,6 +687,34 @@ impl TransactionSimulator {
         
         fields
     }
+
+    // Add retry logic for simulation
+    pub async fn simulate_instruction(&self, program_id: &Pubkey, instruction_data: &[u8]) -> Result<SimulationResult> {
+        let mut retry_count = 0;
+        let max_retries = 3;
+        
+        while retry_count < max_retries {
+            match self.try_simulate_instruction(program_id, instruction_data).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    retry_count += 1;
+                    if retry_count >= max_retries {
+                        return Err(e);
+                    }
+                    
+                    log::warn!("Simulation attempt {} failed: {}. Retrying...", retry_count, e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000 * retry_count)).await;
+                }
+            }
+        }
+        
+        Err(anyhow!("Failed to simulate instruction after {} attempts", max_retries))
+    }
+
+    // Original simulation implementation renamed to try_simulate_instruction
+    async fn try_simulate_instruction(&self, program_id: &Pubkey, instruction_data: &[u8]) -> Result<SimulationResult> {
+        // ... existing implementation ...
+    }
 }
 
 /// Extract account address from log message

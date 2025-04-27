@@ -3,9 +3,9 @@
 use serde::{Serialize, Deserialize};
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
-use crate::analyzer::patterns_simplified::PatternAnalysis;
 use crate::monitor::transaction::TransactionAnalysis;
 use crate::models::transaction_pattern::TransactionPattern;
+use crate::analyzer::patterns::PatternAnalysis;
 
 /// Interface Description Language (IDL) for a Solana program
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -113,23 +113,15 @@ impl IDL {
             // Find the instruction with this index
             if let Some(instruction) = self.instructions.iter_mut().find(|i| i.index == pattern.index) {
                 // Add any missing arguments from pattern
-                for arg in &pattern.args {
-                    if !instruction.args.iter().any(|a| a.name == arg.name) {
-                        instruction.add_arg(arg.name.clone(), arg.ty.clone());
+                for (i, param_type) in pattern.parameter_types.iter().enumerate() {
+                    let arg_name = format!("arg_{}", i);
+                    if !instruction.args.iter().any(|a| a.name == arg_name) {
+                        instruction.add_arg(arg_name, param_type.clone());
                     }
                 }
                 
-                // Add any missing accounts from pattern
-                for account in &pattern.accounts {
-                    if !instruction.accounts.iter().any(|a| a.name == account.name) {
-                        instruction.add_account(
-                            account.name.clone(), 
-                            account.is_signer, 
-                            account.is_writable, 
-                            false
-                        );
-                    }
-                }
+                // We don't have account information in InstructionPattern
+                // So we'll skip this part or use account patterns from elsewhere
             }
         }
     }
@@ -172,7 +164,7 @@ impl IDL {
                 &mut self.instructions[idx]
             } else {
                 let name = format!("instruction_{}", pattern.discriminator);
-                let mut instr = Instruction::new(name, pattern.discriminator);
+                let instr = Instruction::new(name, pattern.discriminator);
                 self.instructions.push(instr);
                 self.instructions.last_mut().unwrap()
             };

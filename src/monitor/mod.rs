@@ -27,7 +27,7 @@ impl Monitor {
     
     /// Get program data for the given program ID
     pub async fn get_program_data(&self, program_id: &Pubkey) -> Result<Vec<u8>> {
-        rpc::get_program_data(&self.rpc_client, program_id)
+        rpc::get_program_data(&self.rpc_client, program_id).await
     }
     
     /// Get recent transactions for the given program ID

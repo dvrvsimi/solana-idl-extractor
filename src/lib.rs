@@ -76,6 +76,7 @@ pub async fn extract_idl(
     
     // Create monitor for blockchain interaction
     let monitor = monitor::Monitor::new(rpc_url)
+    .await
         .context("Failed to create monitor")?;
     
     // Create analyzer

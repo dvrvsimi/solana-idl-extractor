@@ -5,6 +5,7 @@ use solana_pubkey::Pubkey;
 use solana_transaction_status::EncodedTransaction;
 use crate::models::instruction::Instruction;
 use std::collections::HashMap;
+use crate::analyzer::patterns::analyze_account_patterns;
 
 /// Results of transaction analysis
 pub struct TransactionAnalysis {
@@ -211,7 +212,7 @@ fn analyze_account_usage(
                             let account_idx = *account_idx as usize;
                             if account_idx < decoded.message.static_account_keys().len() {
                                 let is_signer = decoded.message.is_signer(account_idx);
-                                let is_writable = decoded.message.is_maybe_writable(account_idx);
+                                let is_writable = decoded.message.is_maybe_writable(account_idx, None);
                                 
                                 // Ensure we have enough entries in our vector
                                 while account_usage.len() <= account_idx {
@@ -235,6 +236,7 @@ fn analyze_account_usage(
 }
 
 // Improve transaction analysis to detect patterns
+#[allow(dead_code)]
 fn analyze_transaction_patterns(
     program_id: &Pubkey,
     transactions: &[EncodedTransaction],
@@ -267,10 +269,20 @@ fn analyze_transaction_patterns(
         }
         
         // Analyze account patterns
-        let account_patterns = analyze_account_patterns(program_id, &txs, discriminator);
+        let txs_owned: Vec<EncodedTransaction> = txs.iter().map(|&tx| tx.clone()).collect();
+        let account_patterns = analyze_account_patterns(program_id, &txs_owned)
+            .map_err(|e| anyhow::anyhow!("Failed to analyze account patterns: {}", e))?
+            .into_iter()
+            .map(|pattern| AccountPattern {
+                index: pattern.account_index,
+                is_signer: pattern.is_signer,
+                is_writable: pattern.is_writable,
+                frequency: pattern.frequency,
+            })
+            .collect();
         
         // Analyze data patterns
-        let data_patterns = analyze_data_patterns(program_id, &txs, discriminator);
+        let data_patterns = analyze_data_patterns(program_id, transactions, discriminator);
         
         patterns.push(TransactionPattern {
             discriminator,
