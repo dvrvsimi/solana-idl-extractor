@@ -1,6 +1,5 @@
 //! Transaction simulation for IDL enhancement
 
-use anyhow::{Result, Context, anyhow};
 use log::{debug, info, warn};
 use reqwest::Client;
 use serde::{Serialize, Deserialize};
@@ -25,6 +24,7 @@ use crate::models::account::Account as IdlAccount;
 use crate::constants::discriminator::ANCHOR_DISCRIMINATOR_LENGTH;
 use crate::utils::hash::generate_anchor_discriminator;
 use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
+use anyhow::{Result, anyhow, Context};
 
 /// Simulation result for a single instruction
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ pub struct TransactionSimulator {
 
 impl TransactionSimulator {
     /// Create a new transaction simulator
-    pub fn new(rpc_url: &str, program_id: &Pubkey, idl: IDL) -> Result<Self> {
+    pub fn new(rpc_url: &str, program_id: &Pubkey, idl: IDL) -> anyhow::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -130,7 +130,7 @@ impl TransactionSimulator {
     }
     
     /// Simulate all instructions in the IDL
-    pub async fn simulate_all(&self) -> Result<Vec<SimulationResult>> {
+    pub async fn simulate_all(&self) -> anyhow::Result<Vec<SimulationResult>> {
         let mut results = Vec::new();
         
         for instruction in &self.idl.instructions {
@@ -197,14 +197,14 @@ impl TransactionSimulator {
             .map_err(|e| ExtractorError::Simulation(format!("Transaction simulation failed: {}", e)))?;
         
         // Extract logs
-        let logs = if let Some(logs) = result.value.logs {
-            logs
+        let logs = if let Some(logs) = &result.value.logs {
+            logs.clone()
         } else {
             Vec::new()
         };
         
         // Extract error
-        let error = if let Some(err) = result.value.err {
+        let error = if let Some(err) = &result.value.err {
             Some(format!("{:?}", err))
         } else {
             None
@@ -255,7 +255,7 @@ impl TransactionSimulator {
     }
     
     /// Generate mock accounts for an instruction
-    fn generate_mock_accounts(&self, instruction: &IdlInstruction) -> Result<(Vec<AccountMeta>, HashMap<String, Vec<u8>>)> {
+    fn generate_mock_accounts(&self, instruction: &IdlInstruction) -> anyhow::Result<(Vec<AccountMeta>, HashMap<String, Vec<u8>>)> {
         let mut accounts = Vec::new();
         let mut account_data = HashMap::new();
         
@@ -306,7 +306,7 @@ impl TransactionSimulator {
     }
     
     /// Generate instruction data
-    fn generate_instruction_data(&self, instruction: &IdlInstruction) -> Result<Vec<u8>> {
+    fn generate_instruction_data(&self, instruction: &IdlInstruction) -> anyhow::Result<Vec<u8>> {
         let mut data = Vec::new();
         
         // For Anchor programs, add discriminator
@@ -350,7 +350,7 @@ impl TransactionSimulator {
     }
     
     /// Create a compute budget instruction
-    fn create_compute_budget_instruction(&self, units: u32) -> Result<Instruction> {
+    fn create_compute_budget_instruction(&self, units: u32) -> anyhow::Result<Instruction> {
         // Compute budget program ID
         let program_id = Pubkey::from_str("ComputeBudget111111111111111111111111111111")?;
         
@@ -367,7 +367,7 @@ impl TransactionSimulator {
     }
     
     /// Get recent blockhash
-    async fn get_recent_blockhash(&self) -> Result<[u8; 32]> {
+    async fn get_recent_blockhash(&self) -> anyhow::Result<[u8; 32]> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -397,7 +397,7 @@ impl TransactionSimulator {
     }
     
     /// Simulate a transaction
-    async fn simulate_transaction(&self, transaction: &Transaction) -> Result<SimulateResult> {
+    async fn simulate_transaction(&self, transaction: &Transaction) -> anyhow::Result<SimulateResult> {
         // Encode transaction
         let serialized = bincode::serialize(transaction)?;
         let encoded = bs58::encode(serialized).into_string();
@@ -433,7 +433,7 @@ impl TransactionSimulator {
     fn analyze_account_changes(&self, 
                               account_data: &HashMap<String, Vec<u8>>, 
                               logs: &[String],
-                              result: &SimulateResult) -> Result<Vec<AccountChange>> {
+                              result: &SimulateResult) -> anyhow::Result<Vec<AccountChange>> {
         let mut changes = Vec::new();
         
         // Extract account changes from simulation result
@@ -481,7 +481,7 @@ impl TransactionSimulator {
     }
     
     /// Enhance IDL based on simulation results
-    pub fn enhance_idl(&self, results: &[SimulationResult]) -> Result<IDL> {
+    pub fn enhance_idl(&self, results: &[SimulationResult]) -> anyhow::Result<IDL> {
         let mut enhanced_idl = self.idl.clone();
         
         // Enhance instructions
@@ -725,7 +725,8 @@ fn extract_instruction_from_transaction(transaction_data: &[u8], program_id: &Pu
     };
     
     let (data, accounts) = crate::utils::transaction_parser::parse_transaction(transaction_data)
-        .with_context(context.clone())?;
+        .map_err(|e| anyhow::Error::from(e))
+        .map_err(|e| ExtractorError::from_anyhow(e, context.clone()))?;
     
     // Create an instruction from the parsed data
     let instruction = Instruction {

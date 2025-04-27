@@ -70,7 +70,7 @@ pub fn parse_transaction(transaction_data: &[u8]) -> ExtractorResult<(Vec<u8>, V
     }
     
     // Add context to the error
-    result.with_context(context)
+    result.map_err(|e| ExtractorError::from_anyhow(e.into(), context))
 }
 
 /// Try to parse transaction data as a binary transaction.

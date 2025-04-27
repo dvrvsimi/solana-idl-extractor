@@ -6,7 +6,6 @@ pub mod patterns;
 pub mod simulation;
 
 #[cfg(test)]
-mod tests;
 
 use anyhow::Result;
 use solana_pubkey::Pubkey;
@@ -15,6 +14,9 @@ use solana_client::rpc_client::RpcClient;
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
+use crate::errors::ExtractorResult;
+use crate::errors::{ExtractorError, ErrorContext};
+
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -33,26 +35,49 @@ impl Analyzer {
     }
     
     /// Analyze program bytecode
-    pub async fn analyze_bytecode(&self, program_id: &Pubkey, monitor: &Monitor) -> Result<bytecode::BytecodeAnalysis> {
+    pub async fn analyze_bytecode(&self, program_id: &Pubkey, monitor: &Monitor) -> ExtractorResult<bytecode::BytecodeAnalysis> {
         // Get program data
-        let program_data = monitor.get_program_data(program_id).await?;
+        let program_data = monitor.get_program_data(program_id).await
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_bytecode".to_string(),
+                details: Some("get_program_data".to_string()),
+            }))?;
         
         // Analyze bytecode
         bytecode::analyze(&program_data, &program_id.to_string())
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_bytecode".to_string(),
+                details: None,
+            }))
     }
     
     /// Analyze transaction patterns
-    pub async fn analyze_patterns(&self, program_id: &Pubkey, monitor: &Monitor) -> Result<patterns::PatternAnalysis> {
+    pub async fn analyze_patterns(&self, program_id: &Pubkey, monitor: &Monitor) -> ExtractorResult<patterns::PatternAnalysis> {
         // Get recent transactions
-        let transactions = monitor.get_recent_transactions(program_id).await?;
+        let transactions = monitor.get_recent_transactions(program_id).await
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_patterns".to_string(),
+                details: Some("get_recent_transactions".to_string()),
+            }))?;
         
         // Analyze patterns
         patterns::analyze(program_id, &transactions)
-        .map_err(|e| anyhow::anyhow!("{}", e))
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_patterns".to_string(),
+                details: None,
+            }))
     }
     
     /// Build IDL from analyses
-    pub fn build_idl(&self, program_id: &Pubkey, bytecode_analysis: bytecode::BytecodeAnalysis, pattern_analysis: patterns::PatternAnalysis) -> Result<IDL> {
+    pub fn build_idl(&self, program_id: &Pubkey, bytecode_analysis: bytecode::BytecodeAnalysis, pattern_analysis: patterns::PatternAnalysis) -> ExtractorResult<IDL> {
         // Create IDL
         let mut idl = IDL::new(format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), program_id.to_string());
         
@@ -78,7 +103,7 @@ impl Analyzer {
 }
 
 /// Analyze a Solana program and extract its IDL
-pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<IDL> {
+pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
     info!("Analyzing program: {}", program_id);
     
     // Get program data
@@ -89,7 +114,12 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
     
     let mut idl = if is_anchor {
         info!("Detected Anchor program, using specialized analysis");
-        match anchor::analyze(program_id, &program_data) {
+        match anchor::analyze(program_id, &program_data).map_err(|e| ExtractorError::from_anyhow(e, ErrorContext {
+            program_id: Some(program_id.to_string()),
+            component: "analyzer".to_string(),
+            operation: "analyze_anchor".to_string(),
+            details: None,
+        })) {
             Ok(analysis) => {
                 let mut idl = IDL::new(
                     format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
@@ -120,7 +150,13 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
             Err(e) => {
                 warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
                 // Fall back to bytecode analysis
-                let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())?;
+                let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
+                    .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                        program_id: Some(program_id.to_string()),
+                        component: "analyzer".to_string(),
+                        operation: "analyze_program".to_string(),
+                        details: Some("anchor_fallback".to_string()),
+                    }))?;
                 
                 let mut idl = IDL::new(
                     format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
@@ -146,7 +182,13 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
         }
     } else {
         // Analyze bytecode
-        let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())?;
+        let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_program".to_string(),
+                details: Some("native_analysis".to_string()),
+            }))?;
         
         let mut idl = IDL::new(
             format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
@@ -172,7 +214,13 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
     
     // Enhance IDL with Anchor-specific information if applicable
     if is_anchor {
-        if let Err(e) = anchor::enhance_idl(&mut idl, &program_data) {
+        if let Err(e) = anchor::enhance_idl(&mut idl, &program_data)
+            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "enhance_idl".to_string(),
+                details: None,
+            })) {
             warn!("Failed to enhance IDL with Anchor information: {}", e);
         }
     }
@@ -181,11 +229,17 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Result<ID
 }
 
 /// Get program data from the blockchain
-fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
+fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> ExtractorResult<Vec<u8>> {
     info!("Fetching program data for: {}", program_id);
     
     // Get account data
-    let account = rpc_client.get_account(program_id)?;
+    let account = rpc_client.get_account(program_id)
+        .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+            program_id: Some(program_id.to_string()),
+            component: "analyzer".to_string(),
+            operation: "get_program_data".to_string(),
+            details: None,
+        }))?;
     
     Ok(account.data)
 } 

@@ -16,7 +16,7 @@ use std::fmt;
 /// This enum represents all possible errors that can occur during IDL extraction.
 /// Each variant corresponds to a specific category of errors, with a descriptive
 /// message providing details about the specific error.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ExtractorError {
     /// Errors related to bytecode analysis, such as invalid instructions or CFG construction.
     #[error("Bytecode analysis error: {0}")]
@@ -44,7 +44,7 @@ pub enum ExtractorError {
     
     /// Errors related to file I/O, such as file not found or permission denied.
     #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
     
     /// Errors from external libraries, such as serialization failures.
     #[error("External error: {0}")]
@@ -132,25 +132,33 @@ impl<T, E: std::error::Error + 'static> ErrorExt<T> for Result<T, E> {
     fn with_context(self, context: ErrorContext) -> ExtractorResult<T> {
         self.map_err(|e| {
             let error_msg = format!("{}: {}", context, e);
-            match e.downcast::<ExtractorError>() {
-                Ok(extractor_err) => extractor_err,
-                Err(_) => match e.to_string().to_lowercase() {
-                    s if s.contains("rpc") || s.contains("connection") => 
-                        ExtractorError::Rpc(error_msg),
-                    s if s.contains("bytecode") || s.contains("instruction") => 
-                        ExtractorError::BytecodeAnalysis(error_msg),
-                    s if s.contains("transaction") || s.contains("parse") => 
-                        ExtractorError::TransactionParsing(error_msg),
-                    s if s.contains("pattern") || s.contains("analyze") => 
-                        ExtractorError::PatternAnalysis(error_msg),
-                    s if s.contains("simulation") || s.contains("simulate") => 
-                        ExtractorError::Simulation(error_msg),
-                    s if s.contains("idl") || s.contains("generate") => 
-                        ExtractorError::IdlGeneration(error_msg),
-                    s if s.contains("io") || s.contains("file") => 
-                        ExtractorError::Io(std::io::Error::new(std::io::ErrorKind::Other, error_msg)),
-                    _ => ExtractorError::Unknown(error_msg),
-                }
+            
+            // Convert to a trait object first
+            let e_ref: &(dyn std::error::Error + 'static) = &e;
+            
+            // Check if it's already an ExtractorError
+            if let Some(extractor_err) = e_ref.downcast_ref::<ExtractorError>() {
+                return extractor_err.clone();
+            }
+            
+            // Otherwise, categorize based on error message
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("rpc") || err_str.contains("connection") {
+                ExtractorError::Rpc(error_msg)
+            } else if err_str.contains("bytecode") || err_str.contains("instruction") {
+                ExtractorError::BytecodeAnalysis(error_msg)
+            } else if err_str.contains("transaction") || err_str.contains("parse") {
+                ExtractorError::TransactionParsing(error_msg)
+            } else if err_str.contains("pattern") || err_str.contains("analyze") {
+                ExtractorError::PatternAnalysis(error_msg)
+            } else if err_str.contains("simulation") || err_str.contains("simulate") {
+                ExtractorError::Simulation(error_msg)
+            } else if err_str.contains("idl") || err_str.contains("generate") {
+                ExtractorError::IdlGeneration(error_msg)
+            } else if err_str.contains("io") || err_str.contains("file") {
+                ExtractorError::Io(error_msg)
+            } else {
+                ExtractorError::Unknown(error_msg)
             }
         })
     }
@@ -162,5 +170,38 @@ impl<T, E: std::error::Error + 'static> ErrorExt<T> for Result<T, E> {
             operation: operation.to_string(),
             details: None,
         })
+    }
+}
+
+// Add From implementation for std::io::Error
+impl From<std::io::Error> for ExtractorError {
+    fn from(err: std::io::Error) -> Self {
+        ExtractorError::Io(err.to_string())
+    }
+}
+
+impl ExtractorError {
+    pub fn from_anyhow(err: anyhow::Error, context: ErrorContext) -> Self {
+        let error_msg = format!("{}: {}", context, err);
+        
+        // Try to categorize based on error message
+        let err_str = err.to_string().to_lowercase();
+        if err_str.contains("rpc") || err_str.contains("connection") {
+            ExtractorError::Rpc(error_msg)
+        } else if err_str.contains("bytecode") || err_str.contains("instruction") {
+            ExtractorError::BytecodeAnalysis(error_msg)
+        } else if err_str.contains("transaction") || err_str.contains("parse") {
+            ExtractorError::TransactionParsing(error_msg)
+        } else if err_str.contains("pattern") || err_str.contains("analyze") {
+            ExtractorError::PatternAnalysis(error_msg)
+        } else if err_str.contains("simulation") || err_str.contains("simulate") {
+            ExtractorError::Simulation(error_msg)
+        } else if err_str.contains("idl") || err_str.contains("generate") {
+            ExtractorError::IdlGeneration(error_msg)
+        } else if err_str.contains("io") || err_str.contains("file") {
+            ExtractorError::Io(error_msg)
+        } else {
+            ExtractorError::Unknown(error_msg)
+        }
     }
 }

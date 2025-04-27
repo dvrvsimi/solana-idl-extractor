@@ -78,7 +78,7 @@ pub fn generate_typescript(idl: &IDL) -> Result<String> {
         
         // Add fields
         for field in &account.fields {
-            ts_code.push_str(&format!("  {}?: {};\n", field.name, ts_type_for_rust_type(&field.type_name)));
+            ts_code.push_str(&format!("  {}?: {};\n", field.name, ts_type_for_rust_type(&field.ty)));
         }
         
         ts_code.push_str("}\n\n");
