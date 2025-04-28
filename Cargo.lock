@@ -4796,6 +4796,7 @@ dependencies = [
  "env_logger 0.10.2",
  "goblin",
  "log",
+ "once_cell",
  "rand 0.8.5",
  "reqwest",
  "serde",

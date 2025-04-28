@@ -3,7 +3,8 @@
 use anyhow::{Result, anyhow};
 use solana_client::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
-use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding};
+// Add this import at the top of the file
+use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiTransaction};
 use solana_signature::Signature;
 use solana_account::Account;
 use reqwest;
@@ -207,6 +208,8 @@ pub async fn get_recent_blockhash(rpc_client: &RpcClient) -> Result<String> {
 
 /// Get program data for the given program ID with retry logic
 pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
+    log::info!("RPC: Fetching program data for: {}", program_id);
+    
     // Build RPC request
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -218,12 +221,14 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
         ]
     });
     
+    log::info!("RPC: Sending getAccountInfo request to {}", rpc_client.url());
+    
     // Try up to 3 times with exponential backoff
     let mut retry_delay = 1000; // Start with 1 second
     let mut last_error = None;
     
     for attempt in 1..=3 {
-        log::info!("Fetching program data, attempt {}/3", attempt);
+        log::info!("RPC: Fetching program data, attempt {}/3", attempt);
         
         // Send request
         match HTTP_CLIENT.post(rpc_client.url())
@@ -231,17 +236,22 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
             .send()
             .await {
                 Ok(response) => {
+                    log::info!("RPC: Received response from {}", rpc_client.url());
+                    
                     match response.json::<serde_json::Value>().await {
                         Ok(json_response) => {
+                            // Log the raw response for debugging
+                            log::debug!("RPC: Raw response: {}", serde_json::to_string(&json_response).unwrap_or_default());
+                            
                             // Check for RPC error
                             if let Some(error) = json_response.get("error") {
                                 last_error = Some(anyhow!("RPC error: {}", error));
-                                log::warn!("RPC error on attempt {}: {}", attempt, error);
+                                log::warn!("RPC: Error on attempt {}: {}", attempt, error);
                                 
                                 // Check if it's a rate limit error
                                 if let Some(error_msg) = error.get("message").and_then(|m| m.as_str()) {
                                     if error_msg.contains("rate limit") || error_msg.contains("429") {
-                                        log::warn!("Rate limit hit, backing off for longer");
+                                        log::warn!("RPC: Rate limit hit, backing off for longer");
                                         retry_delay *= 4; // More aggressive backoff for rate limits
                                     }
                                 }
@@ -251,6 +261,8 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                     .and_then(|d| d.get(0))
                                     .and_then(|d| d.as_str()) {
                                     
+                                    log::info!("RPC: Successfully received account data");
+                                    
                                     match base64::decode(data_str) {
                                         Ok(data) => {
                                             // Check if this is a program account
@@ -258,68 +270,83 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                                 .and_then(|e| e.as_bool())
                                                 .unwrap_or(false);
                                                 
+                                            log::info!("RPC: Account executable status: {}", executable);
+                                            
                                             if !executable {
-                                                log::warn!("Account is not executable (not a program)");
+                                                log::warn!("RPC: Account is not executable (not a program)");
                                                 
                                                 // Check if this is a BPF Upgradeable Loader account
                                                 let owner = result.get("owner")
                                                     .and_then(|o| o.as_str())
                                                     .unwrap_or("");
                                                 
+                                                log::info!("RPC: Account owner: {}", owner);
+                                                
                                                 if owner == "BPFLoaderUpgradeab1e11111111111111111111111" {
-                                                    log::info!("This is a BPF Upgradeable Loader account, fetching program data");
+                                                    log::info!("RPC: This is a BPF Upgradeable Loader account, fetching program data");
                                                     
                                                     // Parse the program data account address from the data
                                                     if data.len() >= 36 {
-                                                        let program_data_address = Pubkey::new(&data[4..36]);
-                                                        log::info!("Program data account: {}", program_data_address);
+                                                        // Use a compatible method to create Pubkey
+                                                        let mut program_data_bytes = [0u8; 32];
+                                                        program_data_bytes.copy_from_slice(&data[4..36]);
+                                                        let program_data_address = Pubkey::new_from_array(program_data_bytes);
+                                                        
+                                                        log::info!("RPC: Program data account: {}", program_data_address);
                                                         
                                                         // Recursively fetch the program data account
-                                                        return get_program_data(rpc_client, &program_data_address).await;
+                                                        return Box::pin(get_program_data(rpc_client, &program_data_address)).await;
+                                                    } else {
+                                                        log::error!("RPC: Data too short for BPF Upgradeable Loader: {} bytes", data.len());
                                                     }
+                                                } else {
+                                                    log::warn!("RPC: Not a BPF Upgradeable Loader account, owner: {}", owner);
                                                 }
                                                 
                                                 return Err(anyhow!("Account is not executable (not a program)"));
                                             }
                                             
-                                            log::info!("Successfully fetched program data, size: {} bytes", data.len());
+                                            log::info!("RPC: Successfully fetched program data, size: {} bytes", data.len());
                                             return Ok(data);
                                         },
                                         Err(e) => {
                                             last_error = Some(anyhow!("Failed to decode base64 data: {}", e));
-                                            log::warn!("Failed to decode base64 data on attempt {}: {}", attempt, e);
+                                            log::warn!("RPC: Failed to decode base64 data on attempt {}: {}", attempt, e);
                                         }
                                     }
                                 } else {
                                     last_error = Some(anyhow!("Invalid account data format"));
-                                    log::warn!("Invalid account data format on attempt {}", attempt);
+                                    log::warn!("RPC: Invalid account data format on attempt {}", attempt);
+                                    // Log the actual structure we received
+                                    log::debug!("RPC: Result structure: {}", serde_json::to_string(result).unwrap_or_default());
                                 }
                             } else {
                                 last_error = Some(anyhow!("Account not found or empty result"));
-                                log::warn!("Account not found or empty result on attempt {}", attempt);
+                                log::warn!("RPC: Account not found or empty result on attempt {}", attempt);
                             }
                         },
                         Err(e) => {
                             last_error = Some(anyhow!("Failed to parse JSON response: {}", e));
-                            log::warn!("Failed to parse JSON response on attempt {}: {}", attempt, e);
+                            log::warn!("RPC: Failed to parse JSON response on attempt {}: {}", attempt, e);
                         }
                     }
                 },
                 Err(e) => {
                     last_error = Some(anyhow!("Request error: {}", e));
-                    log::warn!("Request error on attempt {}: {}", e, attempt);
+                    log::warn!("RPC: Request error on attempt {}: {}", e, attempt);
                 }
             }
         
         // If this wasn't the last attempt, wait before retrying
         if attempt < 3 {
-            log::info!("Retrying in {} ms", retry_delay);
+            log::info!("RPC: Retrying in {} ms", retry_delay);
             tokio::time::sleep(Duration::from_millis(retry_delay)).await;
             retry_delay *= 2; // Exponential backoff
         }
     }
     
     // If we got here, all attempts failed
+    log::error!("RPC: All attempts to fetch program data failed");
     Err(last_error.unwrap_or_else(|| anyhow!("Failed to fetch program data after 3 attempts")))
 }
 
@@ -381,7 +408,7 @@ pub async fn get_recent_transactions(
     // Now fetch the actual transactions
     let mut transactions = Vec::new();
     
-    for signature_batch in signatures.chunks(10) { // Process in batches to avoid rate limits
+    for signature_batch in signatures.chunks(3) { // Process in batches to avoid rate limits
         // Build RPC request for getTransaction
         let batch_request = signature_batch.iter().enumerate().map(|(i, signature)| {
             serde_json::json!({
@@ -416,14 +443,22 @@ pub async fn get_recent_transactions(
             if let Some(result) = response.get("result") {
                 if let Some(transaction) = result.get("transaction") {
                     // Convert to EncodedTransaction
-                    let encoded_tx = EncodedTransaction::Json(transaction.clone());
+                    let transaction_str = serde_json::to_string(&transaction).unwrap_or_default();
+                    let ui_transaction = match serde_json::from_str::<UiTransaction>(&transaction_str) {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            log::warn!("Failed to parse UiTransaction: {}", e);
+                            continue; // Skip this transaction
+                        }
+                    };
+                    let encoded_tx = EncodedTransaction::Json(ui_transaction);
                     transactions.push(encoded_tx);
                 }
             }
         }
         
-        // Add a small delay to avoid rate limiting
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Add a large delay to avoid rate limiting
+        tokio::time::sleep(Duration::from_millis(2000)).await;
     }
     
     log::info!("Successfully fetched {} transactions", transactions.len());
