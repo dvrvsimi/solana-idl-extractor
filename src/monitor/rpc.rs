@@ -9,14 +9,204 @@ use solana_account::Account;
 use reqwest;
 use base64;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use once_cell::sync::Lazy;
+
+// Define a set of RPC endpoints to try
+pub const RPC_ENDPOINTS: [&str; 3] = [
+    "https://api.devnet.solana.com",
+    "https://devnet.genesysgo.net", 
+    "https://devnet.helius.xyz"
+];
+
+// A global HTTP client with connection pooling
+static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(10)
+        .build()
+        .expect("Failed to create HTTP client")
+});
+
+// Blockhash cache
+struct BlockhashCache {
+    blockhash: Option<(String, Instant)>,
+}
+
+impl BlockhashCache {
+    fn new() -> Self {
+        Self { blockhash: None }
+    }
+
+    fn get(&self) -> Option<String> {
+        match &self.blockhash {
+            Some((hash, timestamp)) if timestamp.elapsed() < Duration::from_secs(30) => {
+                Some(hash.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, blockhash: String) {
+        self.blockhash = Some((blockhash, Instant::now()));
+    }
+}
+
+static BLOCKHASH_CACHE: Lazy<Arc<Mutex<BlockhashCache>>> = Lazy::new(|| {
+    Arc::new(Mutex::new(BlockhashCache::new()))
+});
+
+/// Check RPC endpoint health
+pub async fn check_endpoint_health(url: &str) -> Result<bool> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getHealth",
+        "params": []
+    });
+    
+    match HTTP_CLIENT.post(url)
+        .json(&request)
+        .send()
+        .await {
+            Ok(response) => {
+                match response.json::<serde_json::Value>().await {
+                    Ok(json_response) => {
+                        if let Some(result) = json_response.get("result") {
+                            // The endpoint is healthy if it returns "ok"
+                            return Ok(result.as_str() == Some("ok"));
+                        }
+                        Ok(false)
+                    },
+                    Err(_) => Ok(false)
+                }
+            },
+            Err(_) => Ok(false)
+        }
+}
+
+/// Try operation with multiple RPC endpoints
+pub async fn try_with_multiple_endpoints<F, T>(operation: F) -> Result<T> 
+where
+    F: Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>> + Send + Copy
+{
+    let mut last_error = None;
+    
+    for endpoint in RPC_ENDPOINTS.iter() {
+        // Check if endpoint is healthy
+        match check_endpoint_health(endpoint).await {
+            Ok(true) => {
+                match operation(endpoint).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        log::warn!("Operation failed with endpoint {}: {}", endpoint, e);
+                        last_error = Some(e);
+                    }
+                }
+            },
+            _ => {
+                log::warn!("Endpoint {} is not healthy, skipping", endpoint);
+            }
+        }
+    }
+    
+    Err(last_error.unwrap_or_else(|| anyhow!("All RPC endpoints failed")))
+}
+
+/// Get recent blockhash with retry logic
+pub async fn get_recent_blockhash(rpc_client: &RpcClient) -> Result<String> {
+    // Check cache first
+    {
+        let cache = BLOCKHASH_CACHE.lock().await;
+        if let Some(cached_hash) = cache.get() {
+            log::debug!("Using cached blockhash");
+            return Ok(cached_hash);
+        }
+    }
+    
+    // Build RPC request
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getRecentBlockhash",
+        "params": []
+    });
+    
+    // Try up to 5 times with exponential backoff
+    let mut retry_delay = 500; // Start with 500ms
+    let mut last_error = None;
+    
+    for attempt in 1..=5 {
+        log::info!("Fetching recent blockhash, attempt {}/5", attempt);
+        
+        // Send request
+        match HTTP_CLIENT.post(rpc_client.url())
+            .json(&request)
+            .send()
+            .await {
+                Ok(response) => {
+                    match response.json::<serde_json::Value>().await {
+                        Ok(json_response) => {
+                            // Check for RPC error
+                            if let Some(error) = json_response.get("error") {
+                                last_error = Some(anyhow!("RPC error: {}", error));
+                                log::warn!("RPC error on attempt {}: {}", attempt, error);
+                                
+                                // Check if it's a rate limit error
+                                if let Some(error_msg) = error.get("message").and_then(|m| m.as_str()) {
+                                    if error_msg.contains("rate limit") || error_msg.contains("429") {
+                                        log::warn!("Rate limit hit, backing off for longer");
+                                        retry_delay *= 4; // More aggressive backoff for rate limits
+                                    }
+                                }
+                            } else if let Some(blockhash) = json_response
+                                .get("result")
+                                .and_then(|r| r.get("value"))
+                                .and_then(|v| v.get("blockhash"))
+                                .and_then(|b| b.as_str()) {
+                                
+                                log::info!("Successfully fetched recent blockhash");
+                                let blockhash = blockhash.to_string();
+                                
+                                // Update cache
+                                let mut cache = BLOCKHASH_CACHE.lock().await;
+                                cache.set(blockhash.clone());
+                                
+                                return Ok(blockhash);
+                            } else {
+                                last_error = Some(anyhow!("Invalid blockhash response format"));
+                                log::warn!("Invalid blockhash response format on attempt {}", attempt);
+                            }
+                        },
+                        Err(e) => {
+                            last_error = Some(anyhow!("Failed to parse JSON response: {}", e));
+                            log::warn!("Failed to parse JSON response on attempt {}: {}", attempt, e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    last_error = Some(anyhow!("Request error: {}", e));
+                    log::warn!("Request error on attempt {}: {}", attempt, e);
+                }
+            }
+        
+        // If this wasn't the last attempt, wait before retrying
+        if attempt < 5 {
+            log::info!("Retrying in {} ms", retry_delay);
+            tokio::time::sleep(Duration::from_millis(retry_delay)).await;
+            retry_delay *= 2; // Exponential backoff
+        }
+    }
+    
+    // If we got here, all attempts failed
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to fetch recent blockhash after 5 attempts")))
+}
 
 /// Get program data for the given program ID with retry logic
 pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Result<Vec<u8>> {
-    // Create HTTP client with timeout
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    
     // Build RPC request
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -36,7 +226,7 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
         log::info!("Fetching program data, attempt {}/3", attempt);
         
         // Send request
-        match client.post(rpc_client.url())
+        match HTTP_CLIENT.post(rpc_client.url())
             .json(&request)
             .send()
             .await {
@@ -47,6 +237,14 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                             if let Some(error) = json_response.get("error") {
                                 last_error = Some(anyhow!("RPC error: {}", error));
                                 log::warn!("RPC error on attempt {}: {}", attempt, error);
+                                
+                                // Check if it's a rate limit error
+                                if let Some(error_msg) = error.get("message").and_then(|m| m.as_str()) {
+                                    if error_msg.contains("rate limit") || error_msg.contains("429") {
+                                        log::warn!("Rate limit hit, backing off for longer");
+                                        retry_delay *= 4; // More aggressive backoff for rate limits
+                                    }
+                                }
                             } else if let Some(result) = json_response.get("result").and_then(|r| r.get("value")) {
                                 // Parse account data
                                 if let Some(data_str) = result.get("data")
@@ -116,7 +314,7 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
         // If this wasn't the last attempt, wait before retrying
         if attempt < 3 {
             log::info!("Retrying in {} ms", retry_delay);
-            tokio::time::sleep(tokio::time::Duration::from_millis(retry_delay)).await;
+            tokio::time::sleep(Duration::from_millis(retry_delay)).await;
             retry_delay *= 2; // Exponential backoff
         }
     }
@@ -134,9 +332,6 @@ pub async fn get_recent_transactions(
     let limit = limit.unwrap_or(100); // Default to 100 transactions
     log::info!("Fetching up to {} recent transactions for program {}", limit, program_id);
     
-    // Create HTTP client
-    let client = reqwest::Client::new();
-    
     // Build RPC request for getSignaturesForAddress
     let signatures_request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -151,7 +346,7 @@ pub async fn get_recent_transactions(
     });
     
     // Send request to get signatures
-    let signatures_response = client.post(rpc_client.url())
+    let signatures_response = HTTP_CLIENT.post(rpc_client.url())
         .json(&signatures_request)
         .send()
         .await?
@@ -204,7 +399,7 @@ pub async fn get_recent_transactions(
         }).collect::<Vec<_>>();
         
         // Send batch request
-        let batch_response = client.post(rpc_client.url())
+        let batch_response = HTTP_CLIENT.post(rpc_client.url())
             .json(&batch_request)
             .send()
             .await?
@@ -228,7 +423,7 @@ pub async fn get_recent_transactions(
         }
         
         // Add a small delay to avoid rate limiting
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
     log::info!("Successfully fetched {} transactions", transactions.len());
