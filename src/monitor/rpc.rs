@@ -16,11 +16,20 @@ use tokio::sync::Mutex;
 use once_cell::sync::Lazy;
 
 // Define a set of RPC endpoints to try
-pub const RPC_ENDPOINTS: [&str; 3] = [
-    "https://api.devnet.solana.com",
-    "https://devnet.genesysgo.net", 
-    "https://devnet.helius.xyz"
-];
+pub fn get_rpc_endpoints() -> Vec<String> {
+    let mut endpoints = vec![
+        "https://api.devnet.solana.com".to_string(),
+        "https://devnet.genesysgo.net".to_string(), 
+        "https://devnet.helius.xyz".to_string(),
+    ];
+    
+    // Add Helius endpoint with API key from env
+    if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+        endpoints.push(format!("https://devnet.helius-rpc.com/?api-key={}", api_key));
+    }
+    
+    endpoints
+}
 
 // A global HTTP client with connection pooling
 static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
@@ -96,7 +105,7 @@ where
 {
     let mut last_error = None;
     
-    for endpoint in RPC_ENDPOINTS.iter() {
+    for endpoint in get_rpc_endpoints().iter() {
         // Check if endpoint is healthy
         match check_endpoint_health(endpoint).await {
             Ok(true) => {
@@ -282,7 +291,7 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                                 
                                                 log::info!("RPC: Account owner: {}", owner);
                                                 
-                                                if owner == "BPFLoaderUpgradeab1e11111111111111111111111" {
+                                                if owner == "BPFLoaderUpgradeab1e1111111111111111111111111" {
                                                     log::info!("RPC: This is a BPF Upgradeable Loader account, fetching program data");
                                                     
                                                     // Parse the program data account address from the data
@@ -351,12 +360,8 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
 }
 
 /// Get recent transactions for the given program ID
-pub async fn get_recent_transactions(
-    rpc_client: &RpcClient, 
-    program_id: &Pubkey,
-    limit: Option<usize>
-) -> Result<Vec<EncodedTransaction>> {
-    let limit = limit.unwrap_or(100); // Default to 100 transactions
+pub async fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey, limit: Option<usize>) -> Result<Vec<EncodedTransaction>> {
+    let limit = limit.unwrap_or(100);
     log::info!("Fetching up to {} recent transactions for program {}", limit, program_id);
     
     // Build RPC request for getSignaturesForAddress
@@ -393,6 +398,7 @@ pub async fn get_recent_transactions(
                     .map(|s| s.to_string())
                     .collect::<Vec<String>>()
             } else {
+                log::warn!("Invalid signature response format: {:?}", result);
                 return Err(anyhow!("Invalid signature response format"));
             }
         },
@@ -405,60 +411,61 @@ pub async fn get_recent_transactions(
         return Ok(Vec::new());
     }
     
-    // Now fetch the actual transactions
+    // Now fetch the actual transactions one by one (no batching)
     let mut transactions = Vec::new();
     
-    for signature_batch in signatures.chunks(3) { // Process in batches to avoid rate limits
+    // Limit the number of transactions to process to avoid long processing times
+    let signatures_to_process = signatures.iter().take(10).collect::<Vec<_>>();
+    log::info!("Processing {} transactions (limited for performance)", signatures_to_process.len());
+    
+    for signature in signatures_to_process {
         // Build RPC request for getTransaction
-        let batch_request = signature_batch.iter().enumerate().map(|(i, signature)| {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": i + 1,
-                "method": "getTransaction",
-                "params": [
-                    signature,
-                    {
-                        "encoding": "json",
-                        "maxSupportedTransactionVersion": 0
-                    }
-                ]
-            })
-        }).collect::<Vec<_>>();
+        let tx_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                signature,
+                {
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 0
+                }
+            ]
+        });
         
-        // Send batch request
-        let batch_response = HTTP_CLIENT.post(rpc_client.url())
-            .json(&batch_request)
+        // Send request
+        let response = HTTP_CLIENT.post(rpc_client.url())
+            .json(&tx_request)
             .send()
-            .await?
-            .json::<Vec<serde_json::Value>>()
             .await?;
         
-        // Process each transaction in the batch
-        for response in batch_response {
-            if let Some(error) = response.get("error") {
-                log::warn!("Error fetching transaction: {}", error);
-                continue;
-            }
-            
-            if let Some(result) = response.get("result") {
-                if let Some(transaction) = result.get("transaction") {
-                    // Convert to EncodedTransaction
-                    let transaction_str = serde_json::to_string(&transaction).unwrap_or_default();
-                    let ui_transaction = match serde_json::from_str::<UiTransaction>(&transaction_str) {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            log::warn!("Failed to parse UiTransaction: {}", e);
-                            continue; // Skip this transaction
-                        }
-                    };
-                    let encoded_tx = EncodedTransaction::Json(ui_transaction);
-                    transactions.push(encoded_tx);
-                }
+        let response_text = response.text().await?;
+        let tx_response: serde_json::Value = serde_json::from_str(&response_text)?;
+        
+        if let Some(error) = tx_response.get("error") {
+            log::warn!("Error fetching transaction {}: {}", signature, error);
+            continue;
+        }
+        
+        if let Some(result) = tx_response.get("result") {
+            if let Some(transaction) = result.get("transaction") {
+                // Convert to EncodedTransaction
+                let transaction_str = serde_json::to_string(&transaction).unwrap_or_default();
+                let ui_transaction = match serde_json::from_str::<UiTransaction>(&transaction_str) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        log::warn!("Failed to parse UiTransaction: {}", e);
+                        continue; // Skip this transaction
+                    }
+                };
+                let encoded_tx = EncodedTransaction::Json(ui_transaction);
+                transactions.push(encoded_tx);
+                log::info!("Successfully fetched transaction {}", signature);
             }
         }
         
-        // Add a large delay to avoid rate limiting
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        // Add a delay to avoid rate limiting
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     
     log::info!("Successfully fetched {} transactions", transactions.len());

@@ -175,7 +175,56 @@ pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
     
     /// Get the text section (code)
     pub fn get_text_section(&self) -> Result<Option<ElfSection>> {
-        self.get_section(".text")
+        
+        // Try standard text section name
+        if let Ok(Some(section)) = self.get_section(".text") {
+            log::info!("Found standard .text section, size: {} bytes", section.data.len());
+            return Ok(Some(section));
+        }
+        
+        // Try alternative text section names
+        for name in &[".text.main", ".text.solana", ".text.program", ".text.spl"] {
+            if let Ok(Some(section)) = self.get_section(name) {
+                log::info!("Found alternative text section: {}, size: {} bytes", name, section.data.len());
+                return Ok(Some(section));
+            }
+        }
+        
+        log::info!("No standard text section found, looking for any executable section");
+        
+        // If no specific text section found, look for any section that might contain code
+        for section_header in &self.elf.section_headers {
+            // Check if section has executable flag
+            if section_header.sh_flags & 0x4 != 0 {
+                if let Some(section_name) = self.elf.shdr_strtab.get_at(section_header.sh_name) {
+                    log::info!("Found executable section: {}", section_name);
+                    
+                    let offset = section_header.sh_offset as usize;
+                    let size = section_header.sh_size as usize;
+                    
+                    let data = if offset > 0 && size > 0 && offset + size <= self.data.len() {
+                        self.data[offset..offset + size].to_vec()
+                    } else {
+                        log::warn!("Section data is invalid or empty");
+                        Vec::new()
+                    };
+                    
+                    log::info!("Using executable section: {}, size: {} bytes", section_name, data.len());
+                    
+                    return Ok(Some(ElfSection {
+                        name: section_name.to_string(),
+                        data,
+                        address: section_header.sh_addr,
+                        size: section_header.sh_size,
+                        section_type: section_header.sh_type,
+                        flags: section_header.sh_flags,
+                    }));
+                }
+            }
+        }
+        
+        log::warn!("No text or executable section found in ELF file");
+        Ok(None)
     }
     
     /// Get the rodata section (read-only data)
@@ -252,6 +301,35 @@ pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         }
         
         false
+    }
+    
+    /// Get all sections in the ELF file
+    pub fn get_all_sections(&self) -> Result<Vec<ElfSection>> {
+        let mut sections = Vec::new();
+        
+        for section_header in &self.elf.section_headers {
+            if let Some(section_name) = self.elf.shdr_strtab.get_at(section_header.sh_name) {
+                let offset = section_header.sh_offset as usize;
+                let size = section_header.sh_size as usize;
+                
+                let data = if offset > 0 && size > 0 && offset + size <= self.data.len() {
+                    self.data[offset..offset + size].to_vec()
+                } else {
+                    Vec::new()
+                };
+                
+                sections.push(ElfSection {
+                    name: section_name.to_string(),
+                    data,
+                    address: section_header.sh_addr,
+                    size: section_header.sh_size,
+                    section_type: section_header.sh_type,
+                    flags: section_header.sh_flags,
+                });
+            }
+        }
+        
+        Ok(sections)
     }
 }
 
