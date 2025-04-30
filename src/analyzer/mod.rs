@@ -10,6 +10,7 @@ pub mod simulation;
 use log::{info, warn, debug};
 use solana_client::rpc_client::RpcClient;
 use anyhow;
+use thiserror::Error;
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
@@ -34,6 +35,11 @@ impl Analyzer {
     
     /// Analyze program bytecode
     pub async fn analyze_bytecode(&self, program_id: &solana_pubkey::Pubkey, monitor: &Monitor) -> ExtractorResult<bytecode::BytecodeAnalysis> {
+
+        // Validate inputs
+        if program_id.to_bytes() == [0; 32] {
+            return Err(AnalyzerError::InvalidProgramData);
+        }
         log::info!("Analyzer: Starting bytecode analysis for {}", program_id);
         
         // Get program data
@@ -406,4 +412,4 @@ fn get_program_data(rpc_client: &RpcClient, program_id: &solana_pubkey::Pubkey) 
         }))?;
     
     Ok(account.data)
-} 
+}

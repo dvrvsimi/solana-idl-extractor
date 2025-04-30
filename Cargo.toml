@@ -1,9 +1,16 @@
 [package]
 name = "solana-idl-extractor"
 version = "0.1.0"
-edition = "2021"
-description = "A tool for extracting IDL from Solana programs"
+description = "A tool to extract Interface Description Language (IDL) from Solana programs through bytecode analysis and instruction parsing"
+authors = ["Your Name <your.email@example.com>"]
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/dvrvsimi/solana-idl-extractor"
+documentation = "https://docs.rs/solana-idl-extractor"
+readme = "README.md"
+keywords = ["solana", "blockchain", "idl", "anchor", "bytecode"]
+categories = ["command-line-utilities", "development-tools", "parser-implementations"]
+edition = "2024"
+rust-version = "1.75.0"  # Specify minimum supported Rust version
 
 [dependencies]
 # Core dependencies

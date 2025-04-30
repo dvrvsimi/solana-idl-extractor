@@ -129,4 +129,9 @@ pub mod opcodes {
     pub const SREM32_REG: u8 = 0xee;  // Signed 32-bit remainder register
     pub const SREM64_IMM: u8 = 0xf6;  // Signed 64-bit remainder immediate
     pub const SREM64_REG: u8 = 0xfe;  // Signed 64-bit remainder register
+
+    // Add these constants to the opcodes module
+    pub const ALU64_REG: u8 = 0x0f;  // 64-bit ALU operation (register)
+    pub const MOV_IMM: u8 = 0xb7;    // Move immediate to register
+    pub const MOV_REG: u8 = 0xbf;    // Move register to register
 }

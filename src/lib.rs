@@ -1,34 +1,24 @@
-//! A library for extracting Interface Description Language (IDL) from Solana programs
+//! # Solana IDL Extractor
 //! 
-//! This crate provides tools to analyze Solana program bytecode and transaction patterns
-//! to generate IDL files that can be used for client-side interaction with the programs.
+//! A library and CLI tool for extracting Interface Description Language (IDL)
+//! from Solana programs through bytecode analysis and instruction parsing.
 //!
-//! # Features
+//! ## Features
 //!
-//! - Bytecode analysis to extract instruction and account information
-//! - Transaction pattern analysis to enhance IDL with real-world usage patterns
-//! - Support for both Anchor and non-Anchor programs
-//! - IDL generation in multiple formats
+//! * Extracts instructions, accounts, and error codes from Solana programs
+//! * Works with both Anchor and native Solana programs
+//! * Uses advanced bytecode analysis techniques to identify program structure
 //!
-//! # Example
+//! ## Example
 //!
-//! ```no_run
-//! use solana_idl_extractor::extract_idl;
-//! use solana_sdk::pubkey::Pubkey;
-//! use std::str::FromStr;
+//! ```
+//! use solana_idl_extractor::analyzer;
 //!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     // Program ID to extract IDL for
-//!     let program_id = Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")?;
+//! fn main() -> anyhow::Result<()> {
+//!     let program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+//!     let program_data = vec![/* program bytecode */];
 //!     
-//!     // RPC URL to use
-//!     let rpc_url = "https://api.mainnet-beta.solana.com";
-//!     
-//!     // Extract IDL
-//!     let idl = extract_idl(&program_id, rpc_url, None, true).await?;
-//!     
-//!     // Print IDL
+//!     let idl = analyzer::analyze_program(&program_id.parse()?, &program_data)?;
 //!     println!("{}", serde_json::to_string_pretty(&idl)?);
 //!     
 //!     Ok(())

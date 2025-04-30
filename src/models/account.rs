@@ -6,13 +6,13 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Account name
-    pub name: String,
+    name: String,
     /// Account type (e.g., "state", "data")
-    pub ty: String,
+    ty: String,
     /// Account fields
-    pub fields: Vec<AccountField>,
+    fields: Vec<AccountField>,
     /// Discriminator for this account
-    pub discriminator: Option<Vec<u8>>,
+    discriminator: Option<Vec<u8>>,
     /// Related accounts
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub related_accounts: Vec<String>,
@@ -62,9 +62,24 @@ impl Account {
         }
     }
     
-    /// Add a field to the account
-    pub fn add_field(&mut self, name: String, ty: String, offset: usize) {
-        self.fields.push(AccountField { name, ty, offset });
+    /// Get the account name
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    
+    /// Get the account type
+    pub fn ty(&self) -> &str {
+        &self.ty
+    }
+    
+    /// Get the account fields
+    pub fn fields(&self) -> &[AccountField] {
+        &self.fields
+    }
+    
+    /// Get a mutable reference to the account fields
+    pub fn fields_mut(&mut self) -> &mut Vec<AccountField> {
+        &mut self.fields
     }
     
     /// Set the discriminator for this account
@@ -75,6 +90,11 @@ impl Account {
     /// Get the discriminator for this account
     pub fn discriminator(&self) -> Option<&Vec<u8>> {
         self.discriminator.as_ref()
+    }
+    
+    /// Add a field to the account
+    pub fn add_field(&mut self, name: String, ty: String, offset: usize) {
+        self.fields.push(AccountField { name, ty, offset });
     }
     
     /// Add a related account

@@ -25,10 +25,20 @@ use std::collections::HashSet;
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::analyzer::anchor::is_anchor_program;
-use crate::analyzer::bytecode::pattern::extract_error_codes;
 use crate::analyzer::bytecode::disassembler::AccessType;
 
 /// Results of bytecode analysis
+///
+/// This struct contains all information extracted from a Solana program's bytecode,
+/// including instructions, accounts, and error codes.
+///
+/// # Examples
+///
+/// ```
+/// # use solana_idl_extractor::analyzer::bytecode::BytecodeAnalysis;
+/// # let analysis = BytecodeAnalysis::default();
+/// println!("Found {} instructions", analysis.instructions.len());
+/// ```
 #[derive(Debug, Clone)]
 pub struct BytecodeAnalysis {
     /// Extracted instructions
@@ -50,6 +60,18 @@ impl Clone for DisassembledProgram {
             functions: self.functions.clone(),
             cfg: self.cfg.clone(),
             memory_accesses: self.memory_accesses.clone(),
+        }
+    }
+}
+
+impl Default for BytecodeAnalysis {
+    fn default() -> Self {
+        Self {
+            instructions: Vec::new(),
+            accounts: Vec::new(),
+            error_codes: HashMap::new(),
+            is_anchor: false,
+            disassembled: None,
         }
     }
 }
@@ -79,7 +101,36 @@ pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis
     // Extract instructions using disassembler if available, otherwise fall back to parser
     let mut instructions = if let Some(disassembled) = &disassembled {
         info!("Extracting instructions from disassembled program");
-        disassembler::extract_instructions(disassembled, program_id)
+        let disasm_instructions = disassembler::extract_instructions(disassembled, program_id);
+        
+        // If disassembler didn't find any instructions, fall back to traditional methods
+        if disasm_instructions.is_empty() {
+            info!("Disassembler found no instructions, falling back to traditional analysis");
+            if let Ok(Some(text)) = elf_analyzer.get_text_section() {
+                let parsed_instructions = parser::parse_instructions(&text.data, text.address as usize)?;
+                let (blocks, functions) = cfg::build_cfg(&parsed_instructions)?;
+                
+                if is_anchor {
+                    info!("Detected Anchor program, using Anchor-specific analysis");
+                    analyze_anchor_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
+                        .instructions
+                } else {
+                    info!("Using native program analysis");
+                    analyze_native_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
+                        .instructions
+                }
+            } else {
+                warn!("Failed to get text section, using fallback analysis");
+                // Fallback: create a generic instruction
+                let mut instruction = Instruction::new("process".to_string(), 0);
+                instruction.add_arg("data".to_string(), "bytes".to_string());
+                instruction.add_account("authority".to_string(), true, false, false);
+                instruction.add_account("data".to_string(), false, true, false);
+                vec![instruction]
+            }
+        } else {
+            disasm_instructions
+        }
     } else {
         info!("Falling back to instruction parser");
         // Parse instructions from text section
@@ -180,9 +231,12 @@ fn analyze_anchor_program(
     let discriminators = discriminator_detection::extract_discriminators(program_data)?;
     
     // For each discriminator, create an instruction
-    for disc in &discriminators {
-        let name = disc.name.clone().unwrap_or_else(|| format!("instruction_{}", disc.code));
-        let mut instruction = Instruction::new(name, 0);
+    for (i, disc) in discriminators.iter().enumerate() {
+        let name = disc.name.clone().unwrap_or_else(|| format!("instruction_{}", disc.code.unwrap_or(i as u8)));
+        let mut instruction = Instruction::new(name.clone(), i as u8);
+        
+        // Set the discriminator bytes
+        instruction.discriminator = Some(disc.bytes.clone());
         
         // Add standard Anchor accounts
         instruction.add_account("authority".to_string(), true, false, false);
@@ -190,6 +244,28 @@ fn analyze_anchor_program(
         
         // Add instruction to list
         instructions.push(instruction);
+    }
+    
+    // If we didn't find any discriminators, try to extract instructions from functions
+    if instructions.is_empty() {
+        info!("No discriminators found, extracting instructions from functions");
+        // Limit to the first 20 functions to avoid overwhelming the IDL
+        for (i, function) in functions.iter().take(20).enumerate() {
+            if blocks[function.entry_block].is_function_entry() {
+                let name = function.name.clone().unwrap_or_else(|| format!("function_{}", function.id));
+                let mut instruction = Instruction::new(name, i as u8);
+                
+                // Add generic arguments
+                instruction.add_arg("data".to_string(), "bytes".to_string());
+                
+                // Add standard accounts
+                instruction.add_account("authority".to_string(), true, false, false);
+                instruction.add_account("data".to_string(), false, true, false);
+                
+                // Add instruction to list
+                instructions.push(instruction);
+            }
+        }
     }
     
     // Extract accounts
@@ -223,26 +299,56 @@ fn analyze_native_program(
     // Extract native program instructions
     let mut instructions = Vec::new();
     
-    // For each function that looks like an entry point, create an instruction
-    for function in functions {
-        // Check if this is likely an entry point function
-        if blocks[function.entry_block].is_function_entry() {
-            let name = function.name.clone().unwrap_or_else(|| format!("function_{}", function.id));
-            let mut instruction = Instruction::new(name, 0);
-            
-            // Add generic arguments
-            instruction.add_arg("data".to_string(), "bytes".to_string());
-            
-            // Add standard accounts
-            instruction.add_account("authority".to_string(), true, false, false);
-            instruction.add_account("data".to_string(), false, true, false);
-            
-            // Add instruction to list
-            instructions.push(instruction);
+    // Identify instruction boundaries using our new function
+    let instruction_entries = identify_instruction_boundaries(parsed_instructions, blocks, program_data);
+    
+    // Create instructions from identified entry points
+    for (i, &entry_point) in instruction_entries.iter().enumerate() {
+        // Try to find a meaningful name for this instruction
+        let name = if entry_point < parsed_instructions.len() {
+            // Look for nearby string references or syscalls to infer purpose
+            infer_instruction_name(parsed_instructions, entry_point, program_data)
+                .unwrap_or_else(|| format!("instruction_{}", i))
+        } else {
+            format!("instruction_{}", i)
+        };
+        
+        let mut instruction = Instruction::new(name, i as u8);
+        
+        // Add generic arguments
+        instruction.add_arg("data".to_string(), "bytes".to_string());
+        
+        // Add standard accounts
+        instruction.add_account("authority".to_string(), true, false, false);
+        instruction.add_account("data".to_string(), false, true, false);
+        
+        // Add instruction to list
+        instructions.push(instruction);
+    }
+    
+    // If we still don't have any instructions, fall back to the function-based approach
+    if instructions.is_empty() {
+        // For each function that looks like an entry point, create an instruction
+        for (i, function) in functions.iter().enumerate() {
+            // Check if this is likely an entry point function
+            if blocks[function.entry_block].is_function_entry() {
+                let name = function.name.clone().unwrap_or_else(|| format!("function_{}", function.id));
+                let mut instruction = Instruction::new(name, i as u8);
+                
+                // Add generic arguments
+                instruction.add_arg("data".to_string(), "bytes".to_string());
+                
+                // Add standard accounts
+                instruction.add_account("authority".to_string(), true, false, false);
+                instruction.add_account("data".to_string(), false, true, false);
+                
+                // Add instruction to list
+                instructions.push(instruction);
+            }
         }
     }
     
-    // If no instructions found, add a generic one
+    // If still no instructions found, add a generic one
     if instructions.is_empty() {
         let mut instruction = Instruction::new("process".to_string(), 0);
         instruction.add_arg("data".to_string(), "bytes".to_string());
@@ -278,6 +384,204 @@ fn analyze_native_program(
         is_anchor: false,
         disassembled: None,
     })
+}
+
+/// Enhanced instruction boundary identification with more sophisticated heuristics
+fn identify_instruction_boundaries(
+    parsed_instructions: &[parser::SbfInstruction],
+    blocks: &[cfg::BasicBlock],
+    program_data: &[u8]
+) -> Vec<usize> {
+    let mut instruction_entries = Vec::new();
+    
+    // 1. BPF Specific Patterns - Look for function prologues
+    for (i, insn) in parsed_instructions.iter().enumerate() {
+        // Check for common BPF function prologue pattern
+        if insn.opcode == 0x0f && // ALU64_REG 
+           insn.dst_reg == 11 && 
+           insn.src_reg == 11 && 
+           insn.imm < 0 {
+            instruction_entries.push(i);
+        }
+        
+        // Check for register r0 being set
+        if i > 0 && 
+           insn.dst_reg == 0 && 
+           (insn.opcode == 0xb7 || // MOV_IMM
+            insn.opcode == 0xbf) { // MOV_REG
+            instruction_entries.push(i - 1);
+        }
+        
+        // Look for instruction discriminator checks
+        // Anchor programs use 8-byte discriminators at the start
+        if i + 8 < parsed_instructions.len() {
+            // Check for loading bytes from instruction data
+            if insn.is_load() && i > 0 {
+                // Check if the next few instructions compare these bytes
+                let mut is_discriminator_check = false;
+                for j in 1..4 {
+                    if i + j < parsed_instructions.len() {
+                        let next_insn = &parsed_instructions[i + j];
+                        if next_insn.opcode == 0x55 || // JNE_IMM
+                           next_insn.opcode == 0x15 {  // JEQ_IMM
+                            is_discriminator_check = true;
+                            break;
+                        }
+                    }
+                }
+                
+                if is_discriminator_check {
+                    // This is likely checking a discriminator
+                    instruction_entries.push(i - 1);
+                }
+            }
+        }
+    }
+    
+    // 2. Control Flow Analysis - Look for "islands" in the code
+    // Identify blocks that have no predecessors (except the entry block)
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 && block.predecessors.is_empty() && !block.instructions.is_empty() {
+            instruction_entries.push(i);
+        }
+        
+        // Look for blocks that end with a return (setting r0 and then exit)
+        if !block.instructions.is_empty() {
+            let last_idx = block.instructions.len() - 1;
+            let last_insn = &block.instructions[last_idx];
+            
+            if last_insn.opcode == 0x95 { // EXIT opcode
+                // Check if r0 was set just before exit (common pattern for returns)
+                if last_idx > 0 {
+                    let prev_insn = &block.instructions[last_idx - 1];
+                    if prev_insn.dst_reg == 0 {
+                        // Found a function that sets return value and exits
+                        if last_idx + 1 < parsed_instructions.len() {
+                            instruction_entries.push(last_idx + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 3. Syscall Analysis - Look for common instruction patterns
+    for (i, insn) in parsed_instructions.iter().enumerate() {
+        if insn.opcode == 0x85 { // CALL opcode
+            // Check if this is a syscall to sol_invoke or sol_invoke_signed
+            let syscall_hash = insn.imm as u32;
+            if syscall_hash == crate::constants::syscalls::hashes::SOL_INVOKE ||
+               syscall_hash == crate::constants::syscalls::hashes::SOL_INVOKE_SIGNED {
+                // This is likely a CPI instruction
+                instruction_entries.push(i);
+            }
+        }
+    }
+    
+    // Remove duplicates and sort
+    instruction_entries.sort();
+    instruction_entries.dedup();
+    
+    instruction_entries
+}
+
+/// Improved instruction name inference using multiple heuristics
+fn infer_instruction_name(
+    instructions: &[parser::SbfInstruction],
+    entry_point: usize,
+    program_data: &[u8]
+) -> Option<String> {
+    // 1. Symbol Recovery - Look for string references near the entry point
+    let window_size = 50.min(instructions.len() - entry_point);
+    let instruction_window = &instructions[entry_point..entry_point + window_size];
+    
+    // Look for string loading patterns
+    for (i, insn) in instruction_window.iter().enumerate() {
+        if insn.is_load_imm() && insn.imm > 0 {
+            // This might be loading a string pointer
+            let potential_str_addr = insn.imm as usize;
+            
+            // Try to extract a string from this address in the program data
+            if potential_str_addr < program_data.len() {
+                let max_len = 30.min(program_data.len() - potential_str_addr);
+                let potential_str = &program_data[potential_str_addr..potential_str_addr + max_len];
+                
+                // Check if this looks like a valid string
+                if let Ok(s) = std::str::from_utf8(potential_str) {
+                    let s = s.split('\0').next().unwrap_or("").trim();
+                    if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                        // This looks like a valid instruction name
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // 2. Syscall Analysis - Infer purpose from syscall usage
+    for (i, insn) in instruction_window.iter().enumerate() {
+        if insn.opcode == 0x85 && insn.imm > 0 { // CALL opcode
+            let syscall_hash = insn.imm as u32;
+            
+            // Map common syscalls to likely instruction names
+            match syscall_hash {
+                hash if hash == crate::constants::syscalls::hashes::SOL_INVOKE => {
+                    return Some("invoke".to_string());
+                },
+                hash if hash == crate::constants::syscalls::hashes::SOL_INVOKE_SIGNED => {
+                    return Some("invoke_signed".to_string());
+                },
+                hash if hash == crate::constants::syscalls::hashes::SOL_CREATE_PROGRAM_ADDRESS => {
+                    return Some("create_address".to_string());
+                },
+                hash if hash == crate::constants::syscalls::hashes::SOL_TRY_FIND_PROGRAM_ADDRESS => {
+                    return Some("find_address".to_string());
+                },
+                hash if hash == crate::constants::syscalls::hashes::SOL_SHA256 => {
+                    return Some("hash".to_string());
+                },
+                _ => {}
+            }
+        }
+    }
+    
+    // 3. Pattern-Based Naming - Look for common instruction patterns
+    
+    // Check for token transfer patterns (loading accounts, then invoking)
+    let mut has_account_loading = false;
+    let mut has_invoke = false;
+    
+    for insn in instruction_window.iter() {
+        if insn.is_load() {
+            has_account_loading = true;
+        }
+        
+        if insn.opcode == 0x85 && // CALL
+           insn.imm as u32 == crate::constants::syscalls::hashes::SOL_INVOKE {
+            has_invoke = true;
+        }
+    }
+    
+    if has_account_loading && has_invoke {
+        return Some("transfer".to_string());
+    }
+    
+    // Check for account initialization patterns
+    let mut has_memset = false;
+    for insn in instruction_window.iter() {
+        if insn.opcode == 0x85 && // CALL
+           insn.imm as u32 == crate::constants::syscalls::hashes::SOL_MEMSET {
+            has_memset = true;
+            break;
+        }
+    }
+    
+    if has_memset {
+        return Some("initialize".to_string());
+    }
+    
+    // 4. Fallback - Use a generic name with the entry point address
+    Some(format!("instruction_{:x}", entry_point))
 }
 
 /// Extract accounts from bytecode
