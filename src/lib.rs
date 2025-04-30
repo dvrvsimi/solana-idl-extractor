@@ -48,7 +48,6 @@ use std::path::Path;
 use anyhow::{Result, Context};
 use log::{info, debug, warn};
 use solana_pubkey::Pubkey;
-use solana_client::rpc_client::RpcClient;
 
 // Re-export key types
 pub use models::idl::IDL;
@@ -92,7 +91,8 @@ pub async fn extract_idl(
     
     // Build IDL
     let idl = analyzer.build_idl(program_id, bytecode_analysis, pattern_analysis)
-        .context("Failed to build IDL")?;
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to build IDL: {}", e))?;
     
     // Save to cache
     if use_cache {
@@ -112,40 +112,94 @@ pub async fn extract_idl(
     Ok(idl)
 }
 
-/// Extract IDL from a Solana program with transaction simulation
+/// Extract IDL with simulation to enhance results
 pub async fn extract_idl_with_simulation(
     program_id: &Pubkey,
     rpc_url: &str,
     output_path: Option<&Path>,
     use_cache: bool,
 ) -> Result<IDL> {
-    // First, extract the basic IDL
-    let mut idl = extract_idl(program_id, rpc_url, None, use_cache).await?;
+    info!("Extracting IDL with simulation for program: {}", program_id);
     
-    // Then enhance it with transaction simulation
-    info!("Enhancing IDL with transaction simulation...");
+    // Check cache first if enabled
+    if use_cache {
+        if let Ok(Some(cached_idl)) = cache::Cache::get_idl(program_id) {
+            info!("Using cached IDL for program: {}", program_id);
+            return Ok(cached_idl);
+        }
+    }
     
-    // Create a transaction simulator
-    let simulator = TransactionSimulator::new(rpc_url, program_id, idl.clone())?;
+    // Create monitor for blockchain interaction
+    let monitor = monitor::Monitor::new(rpc_url)
+        .await
+        .context("Failed to create monitor")?;
     
-    // Simulate all instructions
-    let simulation_results = simulator.simulate_all().await?;
+    // Create analyzer
+    let analyzer = analyzer::Analyzer::new();
     
-    // Enhance the IDL based on simulation results
-    idl = simulator.enhance_idl(&simulation_results)?;
+    // Analyze bytecode
+    let bytecode_analysis = analyzer.analyze_bytecode(program_id, &monitor).await
+        .context("Failed to analyze bytecode")?;
     
-    // Save the enhanced IDL if an output path was provided
+    // Analyze transaction patterns
+    let pattern_analysis = analyzer.analyze_patterns(program_id, &monitor).await
+        .context("Failed to analyze transaction patterns")?;
+
+    
+    // First create a temporary IDL with just the instructions
+    let temp_idl = {
+        let mut idl = models::idl::IDL::new(
+            format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+            program_id.to_string()
+        );
+        for instruction in &bytecode_analysis.instructions {
+            idl.add_instruction(instruction.clone());
+        }
+        idl
+    };
+
+
+    // Create transaction simulator
+    let simulator = analyzer::simulation::TransactionSimulator::new(
+        rpc_url,
+        program_id,
+        temp_idl
+    )
+    .context("Failed to create transaction simulator")?;
+    
+    // Simulate instructions to enhance IDL
+    let mut simulation_results = Vec::new();
+    for instruction in &bytecode_analysis.instructions {
+        match simulator.simulate_instruction(instruction).await {
+            Ok(result) => simulation_results.push(result),
+            Err(e) => warn!("Failed to simulate instruction {}: {}", instruction.name, e),
+        }
+    }
+
+    
+    // Build IDL with all analysis results
+    let idl = analyzer.build_idl_with_simulation(
+        program_id, 
+        bytecode_analysis, 
+        pattern_analysis,
+        simulation_results
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to build IDL: {}", e))?;
+    
+    // Save to cache
+    if use_cache {
+        if let Err(e) = cache::Cache::save_idl(program_id, &idl) {
+            warn!("Failed to cache IDL: {}", e);
+        }
+    }
+    
+    // Save to file if path provided
     if let Some(path) = output_path {
-        let enhanced_path = path.with_file_name(format!(
-            "{}_enhanced{}",
-            path.file_stem().unwrap().to_string_lossy(),
-            path.extension().map_or_else(|| "".to_string(), |ext| format!(".{}", ext.to_string_lossy()))
-        ));
+        generator::save_idl(&idl, path)
+            .with_context(|| format!("Failed to save IDL to {}", path.display()))?;
         
-        generator::save_idl(&idl, &enhanced_path)
-            .with_context(|| format!("Failed to save enhanced IDL to {}", enhanced_path.display()))?;
-        
-        info!("Enhanced IDL saved to {}", enhanced_path.display());
+        info!("Saved IDL to {}", path.display());
     }
     
     Ok(idl)

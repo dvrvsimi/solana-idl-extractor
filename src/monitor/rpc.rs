@@ -3,13 +3,9 @@
 use anyhow::{Result, anyhow};
 use solana_client::rpc_client::RpcClient;
 use solana_pubkey::Pubkey;
-// Add this import at the top of the file
-use solana_transaction_status::{EncodedTransaction, UiTransactionEncoding, UiTransaction};
-use solana_signature::Signature;
-use solana_account::Account;
+use solana_transaction_status::{EncodedTransaction, UiTransaction};
 use reqwest;
 use base64;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;

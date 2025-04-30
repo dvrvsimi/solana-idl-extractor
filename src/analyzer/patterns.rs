@@ -7,11 +7,8 @@ use solana_transaction_status::{UiTransactionEncoding, TransactionBinaryEncoding
 use crate::models::instruction::Instruction;
 use crate::constants::discriminator::program_ids;
 use log;
-use std::str::FromStr;
-use solana_clock::Clock;
-use solana_rent::Rent;
 use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
-use solana_program::sysvar::SysvarId;
+use std::collections::{HashMap, HashSet, BTreeMap};
 
 /// Results of pattern analysis
 pub struct PatternAnalysis {
@@ -69,6 +66,7 @@ pub fn analyze(
     let account_patterns = analyze_account_patterns(program_id, transactions)
         .with_simple_context("pattern_analyzer", "analyze_account_patterns")?;
     
+    // Return the analysis with empty vectors if no patterns were found
     Ok(PatternAnalysis {
         instruction_patterns,
         account_patterns,
@@ -777,14 +775,6 @@ pub fn identify_account_type(
         return "token_program".to_string();
     }
     
-    if account_pubkey == &Rent::id() {
-        return "rent".to_string();
-    }
-    
-    if account_pubkey == &Clock::id() {
-        return "clock".to_string();
-    }
-    
     // Heuristics for other account types
     if is_signer && is_writable {
         return "authority".to_string();
@@ -929,4 +919,140 @@ fn extract_discriminator_raw(instruction: &UiCompiledInstruction) -> u8 {
         }
     }
     0
+}
+
+/// Analyze account usage patterns in transactions
+pub fn analyze_account_usage(
+    program_id: &Pubkey,
+    transactions: &[solana_transaction_status::EncodedTransaction]
+) -> Result<HashMap<String, AccountUsagePattern>> {
+    let mut account_usage = HashMap::new();
+    
+    for transaction in transactions {
+        let accounts = extract_accounts_from_transaction(transaction, program_id)?;
+        
+        for (idx, account) in accounts.iter().enumerate() {
+            let key = account.pubkey.to_string();
+            let entry = account_usage.entry(key).or_insert_with(|| AccountUsagePattern {
+                address: account.pubkey.clone(),
+                frequency: 0,
+                signer_frequency: 0,
+                writable_frequency: 0,
+                position_frequencies: HashMap::new(),
+                instruction_frequencies: HashMap::new(),
+            });
+            
+            entry.frequency += 1;
+            
+            if account.is_signer {
+                entry.signer_frequency += 1;
+            }
+            
+            if account.is_writable {
+                entry.writable_frequency += 1;
+            }
+            
+            // Track position frequency
+            *entry.position_frequencies.entry(idx).or_insert(0) += 1;
+            
+            // Track which instructions use this account
+            if let Some(instruction_idx) = get_instruction_index_for_account(transaction, idx) {
+                *entry.instruction_frequencies.entry(instruction_idx).or_insert(0) += 1;
+            }
+        }
+    }
+    
+    Ok(account_usage)
+}
+
+/// Account usage pattern
+#[derive(Debug, Clone)]
+pub struct AccountUsagePattern {
+    /// Account address
+    pub address: String,
+    /// How often this account appears
+    pub frequency: usize,
+    /// How often this account is a signer
+    pub signer_frequency: usize,
+    /// How often this account is writable
+    pub writable_frequency: usize,
+    /// Frequency of positions in the accounts array
+    pub position_frequencies: HashMap<usize, usize>,
+    /// Frequency of instructions using this account
+    pub instruction_frequencies: HashMap<u8, usize>,
+}
+
+/// Extract accounts from a transaction
+fn extract_accounts_from_transaction(
+    transaction: &solana_transaction_status::EncodedTransaction,
+    program_id: &Pubkey
+) -> Result<Vec<TransactionAccount>> {
+    let mut accounts = Vec::new();
+    
+    match transaction {
+        solana_transaction_status::EncodedTransaction::Json(ui_transaction) => {
+            // Process JSON-encoded transaction
+            let ui_message = &ui_transaction.message;
+            
+            // Extract accounts based on message type
+            match ui_message {
+                UiMessage::Parsed(parsed_message) => {
+                    // Find program instructions
+                    for instruction in &parsed_message.instructions {
+                        if let Some(program_id_str) = get_program_id(instruction, ui_message) {
+                            if program_id_str == program_id.to_string() {
+                                // Extract accounts for this instruction
+                                if let Some(account_indices) = get_instruction_accounts(instruction) {
+                                    for (idx, account_idx) in account_indices.iter().enumerate() {
+                                        let account_idx = account_idx.parse::<usize>()?;
+                                        if account_idx < parsed_message.account_keys.len() {
+                                            let account_key = &parsed_message.account_keys[account_idx];
+                                            let is_signer = account_key.signer;
+                                            let is_writable = account_key.writable;
+                                            
+                                            accounts.push(TransactionAccount {
+                                                pubkey: account_key.pubkey.clone(),
+                                                is_signer,
+                                                is_writable,
+                                                position: idx,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                // Handle other message types...
+                _ => {}
+            }
+        },
+        // Handle other transaction types...
+        _ => {}
+    }
+    
+    Ok(accounts)
+}
+
+/// Transaction account
+#[derive(Debug, Clone)]
+struct TransactionAccount {
+    /// Account public key
+    pub pubkey: String,
+    /// Is this account a signer?
+    pub is_signer: bool,
+    /// Is this account writable?
+    pub is_writable: bool,
+    /// Position in the accounts array
+    pub position: usize,
+}
+
+/// Get instruction index for an account
+fn get_instruction_index_for_account(
+    transaction: &solana_transaction_status::EncodedTransaction,
+    account_idx: usize
+) -> Option<u8> {
+    // Implementation would extract the instruction index
+    // This is a placeholder
+    Some(0)
 } 

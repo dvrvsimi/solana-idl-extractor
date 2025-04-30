@@ -7,16 +7,14 @@ pub mod simulation;
 
 #[cfg(test)]
 
-use anyhow::Result;
-use solana_pubkey::Pubkey;
-use log::{info, warn};
+use log::{info, warn, debug};
 use solana_client::rpc_client::RpcClient;
+use anyhow;
 
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
-
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -35,7 +33,7 @@ impl Analyzer {
     }
     
     /// Analyze program bytecode
-    pub async fn analyze_bytecode(&self, program_id: &Pubkey, monitor: &Monitor) -> ExtractorResult<bytecode::BytecodeAnalysis> {
+    pub async fn analyze_bytecode(&self, program_id: &solana_pubkey::Pubkey, monitor: &Monitor) -> ExtractorResult<bytecode::BytecodeAnalysis> {
         log::info!("Analyzer: Starting bytecode analysis for {}", program_id);
         
         // Get program data
@@ -53,6 +51,14 @@ impl Analyzer {
         // Check if this looks like valid ELF data
         if program_data.len() >= 4 && program_data[0] == 0x7F && program_data[1] == b'E' && program_data[2] == b'L' && program_data[3] == b'F' {
             log::info!("Analyzer: Program data appears to be a valid ELF file");
+            
+            // Check if this is an Anchor program early
+            let is_anchor = anchor::is_anchor_program(&program_data);
+            if is_anchor {
+                log::info!("Analyzer: Detected Anchor program");
+            } else {
+                log::info!("Analyzer: Detected non-Anchor program");
+            }
         } else {
             log::warn!("Analyzer: Program data does not appear to be a valid ELF file");
             // Log the first few bytes for debugging
@@ -81,7 +87,7 @@ impl Analyzer {
     }
     
     /// Analyze transaction patterns
-    pub async fn analyze_patterns(&self, program_id: &Pubkey, monitor: &Monitor) -> ExtractorResult<patterns::PatternAnalysis> {
+    pub async fn analyze_patterns(&self, program_id: &solana_pubkey::Pubkey, monitor: &Monitor) -> ExtractorResult<patterns::PatternAnalysis> {
         // Get recent transactions
         let transactions = monitor.get_recent_transactions(program_id).await
             .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
@@ -101,23 +107,89 @@ impl Analyzer {
             }))
     }
     
-    /// Build IDL from analyses
-    pub fn build_idl(&self, program_id: &Pubkey, bytecode_analysis: bytecode::BytecodeAnalysis, pattern_analysis: patterns::PatternAnalysis) -> ExtractorResult<IDL> {
+    /// Build IDL from analysis results
+    pub async fn build_idl(&self, program_id: &solana_pubkey::Pubkey, bytecode_analysis: BytecodeAnalysis, pattern_analysis: PatternAnalysis) -> ExtractorResult<IDL> {
         // Create IDL
         let mut idl = IDL::new(format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), program_id.to_string());
         
         // Add instructions from bytecode analysis
-        for instruction in bytecode_analysis.instructions {
+        for instruction in bytecode_analysis.instructions.clone() {
             idl.add_instruction(instruction);
         }
         
         // Add accounts from bytecode analysis
-        for account in bytecode_analysis.accounts {
+        for account in bytecode_analysis.accounts.clone() {
             idl.add_account(account);
         }
         
         // Enhance IDL with pattern analysis
-        idl.enhance_with_patterns(&pattern_analysis);
+        for pattern in &pattern_analysis.instruction_patterns {
+            // Find matching instruction in IDL
+            if let Some(instruction) = idl.instructions.iter_mut().find(|i| i.index == pattern.index as u8) {
+                // Update instruction with pattern information
+                for (i, param_type) in pattern.parameter_types.iter().enumerate() {
+                    if i < instruction.args.len() {
+                        // Update existing argument type if it's more specific
+                        if instruction.args[i].ty == "bytes" || instruction.args[i].ty == "unknown" {
+                            instruction.args[i].ty = param_type.clone();
+                        }
+                    } else {
+                        // Add new argument
+                        instruction.add_arg(format!("param_{}", i), param_type.clone());
+                    }
+                }
+            }
+        }
+        
+        // Add account usage patterns
+        for pattern in &pattern_analysis.account_patterns {
+            // Find matching instruction
+            if let Some(instruction) = idl.instructions.iter_mut().find(|i| i.index == pattern.instruction_index) {
+                // Find or add account
+                if pattern.account_index < instruction.accounts.len() {
+                    // Update existing account
+                    instruction.accounts[pattern.account_index].is_signer = pattern.is_signer;
+                    instruction.accounts[pattern.account_index].is_writable = pattern.is_writable;
+                } else {
+                    // Add new account
+                    instruction.add_account(
+                        format!("account_{}", pattern.account_index),
+                        pattern.is_signer,
+                        pattern.is_writable,
+                        false
+                    );
+                }
+            }
+        }
+        
+        // Enhance IDL with account relationship information
+        let relationships = bytecode::account_analyzer::infer_account_relationships(
+            &bytecode_analysis.accounts.clone(),
+            &bytecode_analysis.instructions.clone()
+        );
+        
+        // Add relationship information to accounts in the IDL
+        for account in &mut idl.accounts {
+            if let Some(related) = relationships.get(&account.name) {
+                // Add a field to indicate relationships
+                for related_account in related {
+                    log::debug!("Account {} is related to {}", account.name, related_account);
+                    // You could add a field or metadata to indicate this relationship
+                }
+            }
+        }
+        
+        // Detect account hierarchies
+        let hierarchies = bytecode::account_analyzer::detect_account_hierarchies(
+            &bytecode_analysis.accounts.clone(),
+            &relationships
+        );
+        
+        // Add hierarchy information to accounts in the IDL
+        for (parent, children) in &hierarchies {
+            log::debug!("Account {} is parent of {} children", parent, children.len());
+            // You could add a field or metadata to indicate this hierarchy
+        }
         
         // Set metadata
         idl.metadata.address = program_id.to_string();
@@ -125,11 +197,78 @@ impl Analyzer {
         
         Ok(idl)
     }
+    
+    /// Build IDL with simulation results
+    pub async fn build_idl_with_simulation(
+        &self, 
+        program_id: &solana_pubkey::Pubkey, 
+        bytecode_analysis: BytecodeAnalysis, 
+        pattern_analysis: PatternAnalysis,
+        simulation_results: Vec<simulation::SimulationResult>
+    ) -> ExtractorResult<IDL> {
+        // First build the basic IDL
+        let mut idl = self.build_idl(program_id, bytecode_analysis.clone(), pattern_analysis)
+            .await?;
+        
+        // Enhance IDL with simulation results
+        for result in simulation_results {
+            if let Some(instruction) = idl.instructions.iter_mut()
+                .find(|i| i.name == result.instruction.name || i.index == result.instruction.index) 
+            {
+                // Update instruction with more accurate arguments from simulation
+                if !result.instruction.args.is_empty() {
+                    // Only replace args if simulation found better ones
+                    let has_better_args = result.instruction.args.iter()
+                        .any(|arg| arg.ty != "bytes" && arg.ty != "unknown");
+                    
+                    if has_better_args {
+                        instruction.args = result.instruction.args.clone();
+                    }
+                }
+                
+                // Update accounts with more accurate information
+                for (i, account) in result.instruction.accounts.iter().enumerate() {
+                    if i < instruction.accounts.len() {
+                        // Update existing account
+                        instruction.accounts[i].is_signer = account.is_signer;
+                        instruction.accounts[i].is_writable = account.is_writable;
+                    } else {
+                        // Add new account
+                        instruction.add_account(
+                            account.name.clone(),
+                            account.is_signer,
+                            account.is_writable,
+                            account.is_optional
+                        );
+                    }
+                }
+            }
+            
+            // Add any new accounts discovered during simulation
+            for change in &result.account_changes {
+                if change.is_new && !idl.accounts.iter().any(|a| a.name == change.address) {
+                    // Create a new account from the observed data
+                    let mut account = crate::models::account::Account::new(
+                        format!("Account_{}", idl.accounts.len()),
+                        "account".to_string()
+                    );
+                    
+                    // Add a basic field for the data
+                    account.add_field("data".to_string(), "bytes".to_string(), 0);
+                    
+                    // Add the account to the IDL
+                    idl.add_account(account);
+                }
+            }
+        }
+        
+        Ok(idl)
+    }
 }
 
 /// Analyze a Solana program and extract its IDL
-pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
-    info!("Analyzing program: {}", program_id);
+pub fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
+    log::info!("Analyzing program: {}", program_id);
     
     // Get program data
     let program_data = get_program_data(rpc_client, program_id)?;
@@ -138,7 +277,7 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Extractor
     let is_anchor = anchor::is_anchor_program(&program_data);
     
     let mut idl = if is_anchor {
-        info!("Detected Anchor program, using specialized analysis");
+        log::info!("Detected Anchor program, using specialized analysis");
         match anchor::analyze(program_id, &program_data).map_err(|e| ExtractorError::from_anyhow(e, ErrorContext {
             program_id: Some(program_id.to_string()),
             component: "analyzer".to_string(),
@@ -173,7 +312,7 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Extractor
                 idl
             },
             Err(e) => {
-                warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
+                log::warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
                 // Fall back to bytecode analysis
                 let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
                     .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
@@ -246,7 +385,7 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Extractor
                 operation: "enhance_idl".to_string(),
                 details: None,
             })) {
-            warn!("Failed to enhance IDL with Anchor information: {}", e);
+            log::warn!("Failed to enhance IDL with Anchor information: {}", e);
         }
     }
     
@@ -254,8 +393,8 @@ pub fn analyze_program(program_id: &Pubkey, rpc_client: &RpcClient) -> Extractor
 }
 
 /// Get program data from the blockchain
-fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> ExtractorResult<Vec<u8>> {
-    info!("Fetching program data for: {}", program_id);
+fn get_program_data(rpc_client: &RpcClient, program_id: &solana_pubkey::Pubkey) -> ExtractorResult<Vec<u8>> {
+    log::info!("Fetching program data for: {}", program_id);
     
     // Get account data
     let account = rpc_client.get_account(program_id)

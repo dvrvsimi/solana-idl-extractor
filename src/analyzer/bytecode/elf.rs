@@ -1,12 +1,12 @@
 //! ELF file parsing for Solana programs
 
-use anyhow::{Result, anyhow, Context};
-use goblin::elf::{Elf, header::{EM_BPF, ET_DYN, ET_EXEC}, section_header::*};
+use anyhow::{Result, Context};
+use goblin::elf::{Elf, header::{EM_BPF, ET_DYN, ET_EXEC}};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use log::{debug, info, warn};
+use log::warn;
 
 /// ELF section information
 #[derive(Debug, Clone)]

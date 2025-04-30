@@ -1,5 +1,5 @@
 use anyhow::Result;
-use solana_idl_extractor::{extract_idl, cache::Cache};
+use solana_idl_extractor::{extract_idl, extract_idl_with_simulation, cache::Cache};
 use solana_pubkey::Pubkey;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
     // Extract IDL
     let idl = if simulate {
         println!("Using transaction simulation to enhance IDL...");
-        solana_idl_extractor::extract_idl_with_simulation(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
+        extract_idl_with_simulation(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
     } else {
         extract_idl(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
     };

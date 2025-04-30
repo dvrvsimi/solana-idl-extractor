@@ -263,6 +263,11 @@ impl SbfInstruction {
         self.opcode == opcodes::JEQ_IMM ||
         self.opcode == opcodes::JNE_IMM
     }
+    
+    pub fn is_cmp_reg(&self) -> bool {
+        self.opcode == opcodes::JEQ_REG ||
+        self.opcode == opcodes::JNE_REG
+    }
 }
 
 /// Parse instructions from a byte slice with improved error handling.

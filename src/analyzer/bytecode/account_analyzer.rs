@@ -2,10 +2,12 @@
 
 use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 use crate::models::account::Account;
 use super::parser::{SbfInstruction, parse_instructions};
 use super::elf::ElfAnalyzer;
+use super::discriminator_detection::{AnchorDiscriminator, DiscriminatorKind};
+use crate::utils::hash::generate_anchor_account_discriminator;
 
 /// Field access information
 #[derive(Debug, Clone)]
@@ -33,127 +35,103 @@ struct MemoryAccessPattern {
     is_account: bool,
 }
 
-/// Extract account structures from bytecode analysis
-pub fn extract_account_structures(program_data: &[u8]) -> Result<Vec<Account>> {
+/// Enhanced account structure extraction
+pub fn extract_account_structures(
+    program_data: &[u8],
+    instructions: &[SbfInstruction],
+    discriminators: &[AnchorDiscriminator]
+) -> Result<Vec<Account>> {
+    info!("Performing enhanced account structure extraction");
+    
+    // First try to extract from discriminators (for Anchor programs)
+    let mut accounts = extract_accounts_from_discriminators(discriminators);
+    
+    // If we found accounts from discriminators, enhance them with field analysis
+    if !accounts.is_empty() {
+        enhance_accounts_with_field_analysis(&mut accounts, instructions);
+    } else {
+        // If no accounts from discriminators, try memory access patterns
+        accounts = extract_accounts_from_memory_patterns(program_data, instructions)?;
+    }
+    
+    // Analyze account relationships
+    analyze_account_relationships(&mut accounts, instructions);
+    
+    // If we still don't have accounts, add a generic one
+    if accounts.is_empty() {
+        let mut account = Account::new("State".to_string(), "state".to_string());
+        account.add_field("data".to_string(), "bytes".to_string(), 0);
+        accounts.push(account);
+    }
+    
+    Ok(accounts)
+}
+
+/// Extract accounts from Anchor discriminators
+fn extract_accounts_from_discriminators(discriminators: &[AnchorDiscriminator]) -> Vec<Account> {
     let mut accounts = Vec::new();
-    let mut memory_patterns: HashMap<u8, MemoryAccessPattern> = HashMap::new();
     
-    // Try to parse the ELF file
-    let elf_analyzer = ElfAnalyzer::from_bytes(program_data.to_vec())?;
-    
-    // Get the text section (code)
-    if let Ok(Some(text_section)) = elf_analyzer.get_text_section() {
-        // Parse instructions
-        let instructions = parse_instructions(&text_section.data, text_section.address as usize)?;
-        
-        // Track register values to follow data flow
-        let mut register_values: HashMap<u8, (String, usize)> = HashMap::new();
-        
-        // First pass: identify memory access patterns
-        for (i, insn) in instructions.iter().enumerate() {
-            // Track register assignments
-            if insn.is_mov_imm() {
-                register_values.insert(insn.dst_reg, ("immediate".to_string(), insn.imm as usize));
-            } else if insn.is_mov_reg() {
-                if let Some((source, offset)) = register_values.get(&insn.src_reg).cloned() {
-                    register_values.insert(insn.dst_reg, (source, offset));
-                }
-            } else if insn.is_add_imm() {
-                if let Some((source, offset)) = register_values.get(&insn.dst_reg).cloned() {
-                    register_values.insert(insn.dst_reg, (source, offset + insn.imm as usize));
-                }
-            } else if insn.is_add_reg() {
-                if let Some((source1, offset1)) = register_values.get(&insn.dst_reg).cloned() {
-                    if let Some((source2, offset2)) = register_values.get(&insn.src_reg).cloned() {
-                        register_values.insert(insn.dst_reg, (format!("{}+{}", source1, source2), offset1 + offset2));
-                    }
-                }
-            }
-            
-            // Track memory accesses
-            if insn.is_load() || insn.is_store() {
-                let base_reg = insn.src_reg;
-                let offset = insn.offset as usize;
-                let size = insn.size;
-                let is_write = insn.is_store();
+    for discriminator in discriminators {
+        if discriminator.kind == DiscriminatorKind::Account {
+            if let Some(name) = &discriminator.name {
+                let mut account = Account::new(name.clone(), "account".to_string());
                 
-                // Get context from surrounding instructions
-                let context = get_access_context(&instructions, i);
+                // Convert discriminator to Vec<u8>
+                let disc_vec = discriminator.bytes.to_vec();
+                account.set_discriminator(disc_vec);
                 
-                // Add to memory patterns
-                let pattern = memory_patterns.entry(base_reg).or_insert_with(|| MemoryAccessPattern {
-                    base_reg,
-                    accesses: Vec::new(),
-                    is_account: false,
-                });
+                // Add basic fields that most Anchor accounts have
+                account.add_field("authority".to_string(), "pubkey".to_string(), 8);
                 
-                // Check if we already have this access
-                let existing_access = pattern.accesses.iter_mut().find(|a| a.offset == offset && a.size == size);
-                
-                if let Some(access) = existing_access {
-                    access.frequency += 1;
-                    if is_write {
-                        access.is_write = true;
-                    }
-                    if access.context.is_none() && context.is_some() {
-                        access.context = context;
-                    }
-                } else {
-                    pattern.accesses.push(FieldAccess {
-                        offset,
-                        size,
-                        is_write,
-                        frequency: 1,
-                        context,
-                    });
-                }
+                accounts.push(account);
             }
         }
-        
-        // Second pass: identify which patterns are likely accounts
-        for pattern in memory_patterns.values_mut() {
-            // Sort accesses by offset
-            pattern.accesses.sort_by_key(|a| a.offset);
+    }
+    
+    accounts
+}
+
+/// Extract accounts from memory access patterns
+fn extract_accounts_from_memory_patterns(
+    program_data: &[u8],
+    instructions: &[SbfInstruction]
+) -> Result<Vec<Account>> {
+    let mut accounts = Vec::new();
+    let mut memory_patterns = HashMap::new();
+    
+    // Track memory access patterns
+    for (i, insn) in instructions.iter().enumerate() {
+        if insn.is_load() || insn.is_store() {
+            let base_reg = insn.src_reg;
+            let offset = insn.offset as usize;
+            let size = insn.size;
             
-            // Heuristics to identify accounts:
-            // 1. Has multiple field accesses
-            // 2. Has a discriminator (first 8 bytes) access
-            // 3. Has fields at regular offsets
-            // 4. Has both reads and writes
-            
-            let has_multiple_fields = pattern.accesses.len() >= 3;
-            let has_discriminator_access = pattern.accesses.iter().any(|a| a.offset < 8);
-            let has_regular_offsets = has_regular_offset_pattern(&pattern.accesses);
-            let has_reads_and_writes = pattern.accesses.iter().any(|a| a.is_write) && 
-                                      pattern.accesses.iter().any(|a| !a.is_write);
-            
-            pattern.is_account = has_multiple_fields && 
-                                (has_discriminator_access || has_regular_offsets || has_reads_and_writes);
-        }
-        
-        // Third pass: create account models
-        for (reg, pattern) in &memory_patterns {
-            if !pattern.is_account {
+            // Skip small offsets which are likely instruction data
+            if offset < 8 && base_reg == 2 {
                 continue;
             }
             
-            // Try to determine account name from context
-            let account_name = determine_account_name(pattern, &register_values);
+            // Record this memory access
+            let pattern = memory_patterns.entry(base_reg).or_insert_with(Vec::new);
+            pattern.push((offset, size, insn.is_store(), i));
+        }
+    }
+    
+    // Analyze patterns to identify accounts
+    for (reg, accesses) in memory_patterns {
+        // Sort by offset
+        let mut sorted_accesses = accesses.clone();
+        sorted_accesses.sort_by_key(|a| a.0);
+        
+        // Check if this looks like an account
+        if is_likely_account_pattern(&sorted_accesses) {
+            let account_name = determine_account_name(reg, &sorted_accesses, instructions);
+            let mut account = Account::new(account_name, "account".to_string());
             
-            let mut account = Account::new(account_name.clone(), account_name.to_lowercase());
-            
-            // Group fields by likely structure
-            let fields = group_fields_by_structure(&pattern.accesses);
-            
-            // Add fields to account
-            for (offset, (name, ty, _)) in &fields {
-                account.add_field(name.clone(), ty.clone(), *offset);
-            }
-            
-            // If this looks like an Anchor account, add a discriminator
-            if account_name.contains("Account") && !fields.is_empty() {
-                let discriminator = crate::utils::hash::generate_anchor_account_discriminator(&account_name);
-                account.set_discriminator(discriminator.to_vec());
+            // Add fields based on access patterns
+            let fields = extract_fields_from_accesses(&sorted_accesses);
+            for (name, ty, offset) in fields {
+                account.add_field(name, ty, offset);
             }
             
             accounts.push(account);
@@ -163,171 +141,204 @@ pub fn extract_account_structures(program_data: &[u8]) -> Result<Vec<Account>> {
     Ok(accounts)
 }
 
-/// Get context for a memory access from surrounding instructions
-fn get_access_context(instructions: &[SbfInstruction], index: usize) -> Option<String> {
-    // Look for string references or function calls before this instruction
-    let start = index.saturating_sub(5);
-    let end = std::cmp::min(index + 5, instructions.len());
+/// Check if a memory access pattern is likely an account
+fn is_likely_account_pattern(accesses: &[(usize, usize, bool, usize)]) -> bool {
+    // Heuristics to identify accounts:
     
-    for i in start..end {
-        let insn = &instructions[i];
-        
-        // Look for string loading (often used for logging account names)
-        if insn.is_load_imm() && insn.imm > 0 {
-            // This might be loading a string pointer
-            return Some(format!("context_{}", insn.imm));
-        }
-        
-        // Look for function calls (might indicate account validation)
-        if insn.is_call() {
-            return Some(format!("call_{}", insn.imm));
-        }
-    }
-    
-    None
-}
-
-/// Check if memory accesses have a regular offset pattern
-fn has_regular_offset_pattern(accesses: &[FieldAccess]) -> bool {
-    if accesses.len() < 3 {
+    // 1. Has multiple field accesses
+    if accesses.len() < 2 {
         return false;
     }
     
-    // Check for common patterns
+    // 2. Has a discriminator (first 8 bytes) access for Anchor accounts
+    let has_discriminator = accesses.iter().any(|(offset, size, _, _)| 
+        *offset == 0 && *size == 8
+    );
     
-    // Pattern 1: 8-byte aligned fields (common in Rust structs)
-    let aligned_8 = accesses.iter()
-        .filter(|a| a.offset % 8 == 0)
-        .count() >= accesses.len() / 2;
+    // 3. Has consistent field access patterns
+    let mut prev_offset = 0;
+    let mut consistent_offsets = true;
     
-    // Pattern 2: 4-byte aligned fields
-    let aligned_4 = accesses.iter()
-        .filter(|a| a.offset % 4 == 0)
-        .count() >= accesses.len() / 2;
-    
-    // Pattern 3: Sequential fields with consistent sizes
-    let mut consistent_sizes = true;
-    let mut prev_offset = accesses[0].offset;
-    let mut prev_size = accesses[0].size;
-    
-    for access in &accesses[1..] {
-        if access.offset != prev_offset + prev_size {
-            consistent_sizes = false;
+    for (i, (offset, size, _, _)) in accesses.iter().enumerate() {
+        if i > 0 && *offset != prev_offset + accesses[i-1].1 && *offset != prev_offset {
+            consistent_offsets = false;
             break;
         }
-        prev_offset = access.offset;
-        prev_size = access.size;
+        prev_offset = *offset;
     }
     
-    aligned_8 || aligned_4 || consistent_sizes
+    // 4. Has pubkey-sized accesses (32 bytes)
+    let has_pubkey = accesses.iter().any(|(_, size, _, _)| *size == 32);
+    
+    // Return true if it matches enough heuristics
+    has_discriminator || (consistent_offsets && has_pubkey) || accesses.len() >= 5
 }
 
-/// Determine account name from context
-fn determine_account_name(pattern: &MemoryAccessPattern, register_values: &HashMap<u8, (String, usize)>) -> String {
-    // Try to get name from register source
-    if let Some((source, _)) = register_values.get(&pattern.base_reg) {
-        if source.contains("account") || source.contains("Account") {
-            return source.clone();
-        }
-    }
-    
-    // Try to get name from access contexts
-    for access in &pattern.accesses {
-        if let Some(ref context) = access.context {
-            if context.contains("account") || context.contains("Account") {
-                return context.clone();
+/// Determine account name from access pattern
+fn determine_account_name(
+    reg: u8,
+    accesses: &[(usize, usize, bool, usize)],
+    instructions: &[SbfInstruction]
+) -> String {
+    // Try to find nearby string references that might indicate the account name
+    for &(_, _, _, insn_idx) in accesses {
+        // Look at nearby instructions for string loading
+        let start = insn_idx.saturating_sub(10);
+        let end = (insn_idx + 10).min(instructions.len());
+        
+        for i in start..end {
+            let insn = &instructions[i];
+            if insn.is_load() && insn.is_mov_imm() && insn.imm > 1000 {
+                // This might be loading a string pointer
+                // In a real implementation, we'd try to resolve this to a string
+                return format!("Account_{}", reg);
             }
         }
     }
     
-    // Default name based on access pattern
-    if pattern.accesses.iter().any(|a| a.offset < 8) {
-        "AnchorAccount".to_string()
-    } else {
-        "DataAccount".to_string()
-    }
+    // Default name based on register
+    format!("Account_{}", reg)
 }
 
-/// Group fields by likely structure
-fn group_fields_by_structure(accesses: &[FieldAccess]) -> HashMap<usize, (String, String, usize)> {
-    let mut fields = HashMap::new();
+/// Extract fields from memory accesses
+fn extract_fields_from_accesses(accesses: &[(usize, usize, bool, usize)]) -> Vec<(String, String, usize)> {
+    let mut fields = Vec::new();
+    let mut current_offset = 0;
     
-    // Skip discriminator (first 8 bytes in Anchor accounts)
-    let data_accesses = accesses.iter().filter(|a| a.offset >= 8);
+    // Skip discriminator (first 8 bytes) for Anchor accounts
+    let start_idx = if accesses[0].0 == 0 && accesses[0].1 == 8 { 1 } else { 0 };
     
-    for access in data_accesses {
-        // Check if this is part of a larger field
-        let mut is_part_of_larger = false;
-        
-        for other in accesses {
-            // If there's a larger access that contains this one, it's part of that field
-            if other.offset < access.offset && 
-               other.offset + other.size > access.offset + access.size {
-                is_part_of_larger = true;
-                break;
-            }
-        }
-        
-        if is_part_of_larger {
+    for (i, &(offset, size, _, _)) in accesses[start_idx..].iter().enumerate() {
+        // Skip if this is part of a previous field
+        if i > 0 && offset < current_offset {
             continue;
         }
         
-        // Determine field type based on access pattern
-        let field_type = if is_likely_pubkey(access.offset, accesses) {
-            "Pubkey"
-        } else {
-            match access.size {
-                1 => "u8",
-                2 => "u16",
-                4 => "u32",
-                8 => "u64",
-                _ => "bytes",
-            }
+        // Determine field type based on size
+        let field_type = match size {
+            1 => "u8".to_string(),
+            2 => "u16".to_string(),
+            4 => "u32".to_string(),
+            8 => "u64".to_string(),
+            32 => "pubkey".to_string(),
+            _ => format!("[u8; {}]", size),
         };
         
         // Generate field name
-        let field_name = if field_type == "Pubkey" {
-            if access.offset == 8 {
+        let field_name = if field_type == "pubkey" {
+            if offset == 8 {
                 "authority".to_string()
             } else {
-                format!("pubkey_at_{}", access.offset)
+                format!("pubkey_at_{}", offset)
             }
         } else {
-            format!("field_at_{}", access.offset)
+            format!("field_at_{}", offset)
         };
         
-        fields.insert(access.offset, (field_name, field_type.to_string(), access.size));
+        fields.push((field_name, field_type, offset));
+        current_offset = offset + size;
     }
     
     fields
 }
 
-/// Check if a field is likely a Pubkey based on its usage pattern
-fn is_likely_pubkey(offset: usize, accesses: &[FieldAccess]) -> bool {
-    // Pubkeys are 32 bytes, but often accessed as a 64-bit value
-    // They're typically at specific offsets and have specific usage patterns
+/// Enhance accounts with field analysis
+fn enhance_accounts_with_field_analysis(accounts: &mut Vec<Account>, instructions: &[SbfInstruction]) {
+    for account in accounts.iter_mut() {
+        // Skip if account already has fields
+        if !account.fields.is_empty() {
+            continue;
+        }
+        
+        // Add standard fields based on account name
+        if account.name.to_lowercase().contains("mint") {
+            account.add_field("mint_authority".to_string(), "pubkey".to_string(), 8);
+            account.add_field("supply".to_string(), "u64".to_string(), 40);
+            account.add_field("decimals".to_string(), "u8".to_string(), 48);
+            account.add_field("is_initialized".to_string(), "bool".to_string(), 49);
+            account.add_field("freeze_authority".to_string(), "pubkey".to_string(), 50);
+        } else if account.name.to_lowercase().contains("token") {
+            account.add_field("mint".to_string(), "pubkey".to_string(), 8);
+            account.add_field("owner".to_string(), "pubkey".to_string(), 40);
+            account.add_field("amount".to_string(), "u64".to_string(), 72);
+            account.add_field("delegate".to_string(), "pubkey".to_string(), 80);
+            account.add_field("state".to_string(), "u8".to_string(), 112);
+            account.add_field("is_native".to_string(), "u64".to_string(), 113);
+            account.add_field("delegated_amount".to_string(), "u64".to_string(), 121);
+            account.add_field("close_authority".to_string(), "pubkey".to_string(), 129);
+        } else {
+            // Generic account structure
+            account.add_field("authority".to_string(), "pubkey".to_string(), 8);
+            account.add_field("data".to_string(), "bytes".to_string(), 40);
+        }
+    }
+}
+
+/// Analyze relationships between accounts
+fn analyze_account_relationships(accounts: &mut Vec<Account>, _instructions: &[SbfInstruction]) {
+    // Create a list of mint accounts first
+    let mint_accounts: Vec<String> = accounts.iter()
+        .filter(|a| a.name.to_lowercase().contains("mint"))
+        .map(|a| a.name.clone())
+        .collect();
     
-    // Check if there are multiple 8-byte accesses at consecutive offsets
-    // This might indicate a 32-byte field being accessed in chunks
-    let consecutive_offsets = [offset, offset + 8, offset + 16, offset + 24];
-    let mut found_consecutive = 0;
+    // Then update token accounts
+    for account in accounts.iter_mut() {
+        if account.name.to_lowercase().contains("token") {
+            // Token accounts are related to mints
+            if !mint_accounts.is_empty() {
+                account.add_field("related_mint".to_string(), "pubkey".to_string(), 8);
+            }
+        }
+    }
+}
+
+/// Infer account relationships from instructions and transactions
+pub fn infer_account_relationships(
+    accounts: &[Account],
+    instructions: &[crate::models::instruction::Instruction]
+) -> HashMap<String, Vec<String>> {
+    let mut relationships = HashMap::new();
     
-    for &check_offset in &consecutive_offsets {
-        if accesses.iter().any(|a| a.offset == check_offset && a.size == 8) {
-            found_consecutive += 1;
+    // Analyze instruction account usage patterns
+    for instruction in instructions {
+        let mut related_accounts = Vec::new();
+        
+        for account in &instruction.accounts {
+            related_accounts.push(account.name.clone());
+        }
+        
+        // Record relationships for each account in this instruction
+        for account in &related_accounts {
+            let entry = relationships.entry(account.clone()).or_insert_with(Vec::new);
+            
+            for related in &related_accounts {
+                if related != account && !entry.contains(related) {
+                    entry.push(related.clone());
+                }
+            }
         }
     }
     
-    // If we found at least 2 consecutive 8-byte accesses, this might be a Pubkey
-    if found_consecutive >= 2 {
-        return true;
+    relationships
+}
+
+/// Detect account hierarchies
+pub fn detect_account_hierarchies(
+    accounts: &[Account],
+    relationships: &HashMap<String, Vec<String>>
+) -> HashMap<String, Vec<String>> {
+    let mut hierarchies = HashMap::new();
+    
+    // Identify potential parent accounts
+    for account in accounts {
+        // Accounts with many relationships are likely parent accounts
+        if let Some(related) = relationships.get(&account.name) {
+            if related.len() >= 2 {
+                hierarchies.insert(account.name.clone(), related.clone());
+            }
+        }
     }
     
-    // Check for common Pubkey offsets in Anchor accounts
-    // Authority fields are often at specific offsets
-    if offset == 8 || offset == 40 || offset == 72 {
-        return true;
-    }
-    
-    false
+    hierarchies
 } 

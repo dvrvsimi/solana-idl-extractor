@@ -120,9 +120,17 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
         instructions.push(instruction);
     }
     
+    // Extract account structures - create empty instructions array for now
+    let empty_instructions: Vec<crate::analyzer::bytecode::parser::SbfInstruction> = Vec::new();
+    let empty_discriminators: Vec<crate::analyzer::bytecode::discriminator_detection::AnchorDiscriminator> = Vec::new();
+    
     // Extract account structures
-    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures(program_data)
-        .context("Failed to extract account structures")?;
+    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures(
+        program_data,
+        &empty_instructions,
+        &empty_discriminators
+    )
+    .context("Failed to extract account structures")?;
     
     // Extract custom error codes
     let error_codes = extract_custom_error_codes(program_data)

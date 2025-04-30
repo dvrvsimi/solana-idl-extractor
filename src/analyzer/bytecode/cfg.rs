@@ -366,3 +366,45 @@ pub fn find_byte_comparisons(instructions: &[SbfInstruction]) -> Vec<(usize, u8)
     
     comparisons
 }
+
+
+/// Find functions in a control flow graph
+pub fn find_functions(blocks: &[BasicBlock]) -> Vec<Function> {
+    let mut functions = Vec::new();
+    
+    // Find entry points (blocks with no predecessors or blocks after a return)
+    for (i, block) in blocks.iter().enumerate() {
+        if block.predecessors.is_empty() || 
+           (i > 0 && blocks[i-1].instructions.last().map_or(false, |insn| insn.opcode == opcodes::EXIT)) {
+            let mut function = Function {
+                id: functions.len(),
+                entry_block: i,
+                blocks: vec![i],
+                name: Some(format!("func_{:x}", block.start)),
+                parameters: Vec::new(),
+                return_type: None,
+            };
+            
+            // Add all blocks reachable from this entry point
+            let mut visited = HashSet::new();
+            let mut stack = vec![i];
+            
+            while let Some(block_idx) = stack.pop() {
+                if visited.insert(block_idx) {
+                    function.blocks.push(block_idx);
+                    
+                    // Add successors to the stack
+                    for &succ in &blocks[block_idx].successors {
+                        if !visited.contains(&succ) {
+                            stack.push(succ);
+                        }
+                    }
+                }
+            }
+            
+            functions.push(function);
+        }
+    }
+    
+    functions
+}

@@ -1,11 +1,9 @@
 //! Anchor discriminator detection
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use log::{debug, info, warn};
-use std::collections::{HashMap, HashSet};
-use sha2::{Sha256, Digest};
 
-use crate::constants::discriminator::ANCHOR_DISCRIMINATOR_LENGTH;
+
 use crate::utils::hash::generate_anchor_discriminator;
 use super::parser::{SbfInstruction, parse_instructions};
 
