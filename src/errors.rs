@@ -205,3 +205,25 @@ impl ExtractorError {
         }
     }
 }
+
+/// Analyzer-specific errors
+#[derive(Debug, Error)]
+pub enum AnalyzerError {
+    #[error("Failed to parse ELF file: {0}")]
+    ElfParseError(String),
+    
+    #[error("Failed to disassemble program: {0}")]
+    DisassemblyError(String),
+    
+    #[error("Invalid program data")]
+    InvalidProgramData,
+    
+    #[error("RPC error: {0}")]
+    RpcError(String),
+    
+    #[error("Simulation error: {0}")]
+    SimulationError(String),
+    
+    #[error("Other error: {0}")]
+    Other(#[from] anyhow::Error),
+}

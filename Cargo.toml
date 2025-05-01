@@ -9,7 +9,7 @@ documentation = "https://docs.rs/solana-idl-extractor"
 readme = "README.md"
 keywords = ["solana", "blockchain", "idl", "anchor", "bytecode"]
 categories = ["command-line-utilities", "development-tools", "parser-implementations"]
-edition = "2024"
+edition = "2021"
 rust-version = "1.75.0"  # Specify minimum supported Rust version
 
 [dependencies]

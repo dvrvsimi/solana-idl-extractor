@@ -6,13 +6,13 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// Account name
-    name: String,
+    pub name: String,
     /// Account type (e.g., "state", "data")
-    ty: String,
+    pub ty: String,
     /// Account fields
-    fields: Vec<AccountField>,
+    pub fields: Vec<AccountField>,
     /// Discriminator for this account
-    discriminator: Option<Vec<u8>>,
+    pub discriminator: Option<Vec<u8>>,
     /// Related accounts
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub related_accounts: Vec<String>,

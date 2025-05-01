@@ -3,9 +3,29 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 
-
 use crate::utils::hash::generate_anchor_discriminator;
 use super::parser::{SbfInstruction, parse_instructions};
+
+/// A Solana program instruction discriminator
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discriminator(pub [u8; 8]);
+
+impl Discriminator {
+    /// Create a new discriminator from bytes
+    pub fn new(bytes: [u8; 8]) -> Self {
+        Self(bytes)
+    }
+    
+    /// Get the underlying bytes
+    pub fn bytes(&self) -> &[u8; 8] {
+        &self.0
+    }
+    
+    /// Convert to a vector of bytes
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+}
 
 /// Anchor discriminator information
 #[derive(Debug, Clone)]
@@ -18,6 +38,13 @@ pub struct AnchorDiscriminator {
     pub name: Option<String>,
     /// Instruction code (if applicable)
     pub code: Option<u8>,
+}
+
+impl AnchorDiscriminator {
+    /// Get the discriminator as the newtype
+    pub fn discriminator(&self) -> Discriminator {
+        Discriminator(self.bytes)
+    }
 }
 
 /// Discriminator type
@@ -88,7 +115,7 @@ fn extract_from_instruction_patterns(instructions: &[SbfInstruction], discrimina
                 found = true;
             } else if window[1].is_mov_imm() && window[1].imm > 0 {
                 // Single immediate might be a pointer to the discriminator
-                // In a real implementation, we'd try to resolve this
+                // In a real implementation, we'd try to resolve this TODO!!
                 // For now, just note that we found a pattern
                 found = true;
             }

@@ -16,6 +16,7 @@ use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
+use crate::errors::AnalyzerError;
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -38,7 +39,7 @@ impl Analyzer {
 
         // Validate inputs
         if program_id.to_bytes() == [0; 32] {
-            return Err(AnalyzerError::InvalidProgramData);
+            return Err(ExtractorError::BytecodeAnalysis("Invalid program data".to_string()));
         }
         log::info!("Analyzer: Starting bytecode analysis for {}", program_id);
         
