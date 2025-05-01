@@ -36,15 +36,13 @@ impl Analyzer {
     
     /// Analyze program bytecode
     pub async fn analyze_bytecode(&self, program_id: &solana_pubkey::Pubkey, monitor: &Monitor) -> ExtractorResult<bytecode::BytecodeAnalysis> {
-
         // Validate inputs
         if program_id.to_bytes() == [0; 32] {
             return Err(ExtractorError::BytecodeAnalysis("Invalid program data".to_string()));
         }
-        log::info!("Analyzer: Starting bytecode analysis for {}", program_id);
+        log::info!("Analyzing bytecode for program: {}", program_id);
         
         // Get program data
-        log::info!("Analyzer: Requesting program data from monitor");
         let program_data = monitor.get_program_data(program_id).await
             .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
                 program_id: Some(program_id.to_string()),
@@ -53,30 +51,22 @@ impl Analyzer {
                 details: Some("get_program_data".to_string()),
             }))?;
         
-        log::info!("Analyzer: Received program data, size: {} bytes", program_data.len());
+        log::debug!("Received program data, size: {} bytes", program_data.len());
         
         // Check if this looks like valid ELF data
         if program_data.len() >= 4 && program_data[0] == 0x7F && program_data[1] == b'E' && program_data[2] == b'L' && program_data[3] == b'F' {
-            log::info!("Analyzer: Program data appears to be a valid ELF file");
-            
             // Check if this is an Anchor program early
             let is_anchor = anchor::is_anchor_program(&program_data);
             if is_anchor {
-                log::info!("Analyzer: Detected Anchor program");
+                log::info!("Detected Anchor program");
             } else {
-                log::info!("Analyzer: Detected non-Anchor program");
+                log::info!("Detected native Solana program");
             }
         } else {
-            log::warn!("Analyzer: Program data does not appear to be a valid ELF file");
-            // Log the first few bytes for debugging
-            if !program_data.is_empty() {
-                let preview_size = std::cmp::min(16, program_data.len());
-                log::debug!("Analyzer: First {} bytes: {:?}", preview_size, &program_data[..preview_size]);
-            }
+            log::warn!("Program data does not appear to be a valid ELF file");
         }
         
         // Analyze bytecode
-        log::info!("Analyzer: Analyzing bytecode");
         let result = bytecode::analyze(&program_data, &program_id.to_string())
             .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
                 program_id: Some(program_id.to_string()),
@@ -86,8 +76,8 @@ impl Analyzer {
             }));
         
         match &result {
-            Ok(analysis) => log::info!("Analyzer: Bytecode analysis complete, found {} instructions", analysis.instructions.len()),
-            Err(e) => log::error!("Analyzer: Bytecode analysis failed: {}", e),
+            Ok(analysis) => log::info!("Bytecode analysis complete, found {} instructions", analysis.instructions.len()),
+            Err(e) => log::error!("Bytecode analysis failed: {}", e),
         }
         
         result

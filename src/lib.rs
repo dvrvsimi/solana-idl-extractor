@@ -36,7 +36,7 @@ pub mod errors;
 
 use std::path::Path;
 use anyhow::{Result, Context};
-use log::{info, debug, warn};
+use log::{info, warn};
 use solana_pubkey::Pubkey;
 
 // Re-export key types
@@ -196,7 +196,7 @@ pub async fn extract_idl_with_simulation(
 }
 
 /// Analyze a Solana program and extract its IDL
-fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
+pub fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
     info!("Analyzing program: {}", program_id);
     
     // First, check if this is an Anchor program

@@ -26,37 +26,52 @@ pub struct AnchorAnalysis {
 /// Check if a program is an Anchor program by examining various indicators
 pub fn is_anchor_program(program_data: &[u8]) -> bool {
     // Method 1: Check for Anchor's characteristic string patterns
-    if ANCHOR_PATTERNS.iter().any(|pattern| find_pattern(program_data, pattern)) {
+    if let Some(version) = extract_anchor_version(program_data) {
+        info!("Detected Anchor program with version: {}", version);
         return true;
     }
     
-    // Method 2: Look for Anchor version string
-    if extract_anchor_version(program_data).is_some() {
-        return true;
-    }
-    
-    // Method 3: Check for Anchor discriminator patterns in the code
+    // Method 2: Look for Anchor discriminator patterns in the code
     // This looks for code that checks the first 8 bytes of an account or instruction
     let discriminator_check_pattern = [
         // Load 8 bytes (discriminator length)
         0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     
+    // we need additional confirmation
     if find_pattern(program_data, &discriminator_check_pattern) {
-        return true;
+        // Only consider it Anchor if we also find Anchor-specific error codes
+        let anchor_error_patterns: [&[u8]; 3] = [
+            // ConstraintMut (2000)
+            &[0xd0, 0x07, 0x00, 0x00],
+            // AccountDiscriminatorNotFound (3001)
+            &[0xb9, 0x0b, 0x00, 0x00],
+            // AccountDiscriminatorMismatch (3002)
+            &[0xba, 0x0b, 0x00, 0x00],
+        ];
+        
+        let has_anchor_errors = anchor_error_patterns.iter()
+            .any(|pattern| find_pattern(program_data, pattern));
+            
+        if has_anchor_errors {
+            debug!("Detected Anchor program based on error codes");
+            return true;
+        }
     }
     
-    // Method 4: Check for Anchor error codes
-    // Many Anchor programs contain these specific error codes
-    let error_code_patterns: [&[u8]; 2] = [
-        // ConstraintMut (2000)
-        &[0xd0, 0x07, 0x00, 0x00],
-        // AccountDiscriminatorNotFound (3001)
-        &[0xb9, 0x0b, 0x00, 0x00],
-    ];
+    // Method 3: Check for Anchor string literals
+    const ANCHOR_STRINGS: [&[u8]; 6] = [
+    b"anchor",
+    b"Anchor",
+    b"#[account]",
+    b"#[program]",
+    b"#[instruction]",
+    b"#[error]",
+];
     
-    for pattern in &error_code_patterns {
-        if find_pattern(program_data, pattern) {
+    for &pattern in &ANCHOR_STRINGS {
+        if find_string(program_data, pattern) {
+            debug!("Detected Anchor program based on string literals");
             return true;
         }
     }
@@ -185,7 +200,7 @@ pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, St
     let elf_analyzer = crate::analyzer::bytecode::elf::ElfAnalyzer::from_bytes(program_data.to_vec())?;
     
     // Extract strings from the rodata section
-    if let Ok(Some(rodata)) = elf_analyzer.get_rodata_section() {
+    if let Ok(Some(_rodata)) = elf_analyzer.get_rodata_section() {
         // Look for error message patterns
         let error_patterns = [
             "Error: ",
@@ -262,4 +277,10 @@ pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, St
     }
     
     Ok(error_codes)
+}
+
+// Helper function to find string patterns
+fn find_string(data: &[u8], pattern: &[u8]) -> bool {
+    data.windows(pattern.len())
+        .any(|window| window == pattern)
 } 

@@ -8,6 +8,8 @@ pub mod cfg;
 pub mod discriminator_detection;
 pub mod dynamic_analysis;
 pub mod disassembler;
+pub mod instruction_analyzer;
+pub mod error_analyzer;
 
 // Re-export key components
 pub use parser::parse_instructions;
@@ -24,8 +26,9 @@ use std::collections::HashSet;
 
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
-use crate::analyzer::anchor::is_anchor_program;
 use crate::analyzer::bytecode::disassembler::AccessType;
+use crate::analyzer::anchor::is_anchor_program;
+
 
 /// Results of bytecode analysis
 ///
@@ -77,143 +80,58 @@ impl Default for BytecodeAnalysis {
 }
 
 /// Analyze program bytecode
-pub fn analyze(program_data: &[u8], program_id: &str) -> Result<BytecodeAnalysis> {
+pub fn analyze(program_data: &[u8], program_id: &str) -> anyhow::Result<BytecodeAnalysis> {
     info!("Analyzing program bytecode for {}", program_id);
+    
+    // Check if this looks like valid ELF data
+    if program_data.len() < 4 || program_data[0] != 0x7F || program_data[1] != b'E' || program_data[2] != b'L' || program_data[3] != b'F' {
+        // Check if this might be a BPF upgradeable loader account (36 bytes)
+        if program_data.len() == 36 {
+            return Err(anyhow::anyhow!(
+                "This appears to be a BPF upgradeable loader account (36 bytes), not the actual program binary. \
+                The program data account address is contained in bytes 4-36. \
+                The Monitor should have automatically handled this, but if you're seeing this error, \
+                there might have been an issue fetching the actual program data."
+            ));
+        }
+        
+        return Err(anyhow::anyhow!(
+            "Invalid program data: Not a valid ELF file. Data size: {} bytes. \
+            This could be a BPF upgradeable loader account or a proxy. \
+            The first few bytes: {:?}", 
+            program_data.len(),
+            &program_data.iter().take(10).map(|b| format!("{:02x}", b)).collect::<Vec<_>>()
+        ));
+    }
+    
+    // Create ELF analyzer
+    let elf_analyzer = elf::ElfAnalyzer::from_bytes(program_data.to_vec())
+        .map_err(|e| anyhow::anyhow!("Failed to parse ELF file: {}", e))?;
+    
+    // Get text section
+    let text_section = elf_analyzer.get_text_section()
+        .map_err(|e| anyhow::anyhow!("Failed to get text section: {}", e))?
+        .ok_or_else(|| anyhow::anyhow!("No text section found in ELF file"))?;
+    
+    // Parse instructions
+    let instructions = parser::parse_instructions(&text_section.data, text_section.address as usize)
+        .map_err(|e| anyhow::anyhow!("Failed to parse instructions: {}", e))?;
+    
+    // Build CFG for more advanced analysis
+    let (blocks, functions) = cfg::build_cfg(&instructions)
+        .map_err(|e| anyhow::anyhow!("Failed to build CFG: {}", e))?;
     
     // Check if this is an Anchor program
     let is_anchor = is_anchor_program(program_data);
     
-    // Create ELF analyzer
-    let elf_analyzer = elf::ElfAnalyzer::from_bytes(program_data.to_vec())?;
-    
-    // Try to disassemble the program first
-    let disassembled = match disassembler::disassemble_program(program_data) {
-        Ok(disassembled) => {
-            info!("Successfully disassembled program");
-            Some(disassembled)
-        },
-        Err(e) => {
-            warn!("Failed to disassemble program: {}", e);
-            None
-        }
-    };
-    
-    // Extract instructions using disassembler if available, otherwise fall back to parser
-    let mut instructions = if let Some(disassembled) = &disassembled {
-        info!("Extracting instructions from disassembled program");
-        let disasm_instructions = disassembler::extract_instructions(disassembled, program_id);
-        
-        // If disassembler didn't find any instructions, fall back to traditional methods
-        if disasm_instructions.is_empty() {
-            info!("Disassembler found no instructions, falling back to traditional analysis");
-            if let Ok(Some(text)) = elf_analyzer.get_text_section() {
-                let parsed_instructions = parser::parse_instructions(&text.data, text.address as usize)?;
-                let (blocks, functions) = cfg::build_cfg(&parsed_instructions)?;
-                
-                if is_anchor {
-                    info!("Detected Anchor program, using Anchor-specific analysis");
-                    analyze_anchor_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
-                        .instructions
-                } else {
-                    info!("Using native program analysis");
-                    analyze_native_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
-                        .instructions
-                }
-            } else {
-                warn!("Failed to get text section, using fallback analysis");
-                // Fallback: create a generic instruction
-                let mut instruction = Instruction::new("process".to_string(), 0);
-                instruction.add_arg("data".to_string(), "bytes".to_string());
-                instruction.add_account("authority".to_string(), true, false, false);
-                instruction.add_account("data".to_string(), false, true, false);
-                vec![instruction]
-            }
-        } else {
-            disasm_instructions
-        }
+    // Use the appropriate analysis method
+    if is_anchor {
+        info!("Detected Anchor program, using Anchor-specific analysis");
+        analyze_anchor_program(program_data, program_id, &instructions, &blocks, &functions)
     } else {
-        info!("Falling back to instruction parser");
-        // Parse instructions from text section
-        if let Ok(Some(text)) = elf_analyzer.get_text_section() {
-            let parsed_instructions = parser::parse_instructions(&text.data, text.address as usize)?;
-            let (blocks, functions) = cfg::build_cfg(&parsed_instructions)?;
-            
-            if is_anchor {
-                info!("Detected Anchor program, using Anchor-specific analysis");
-                analyze_anchor_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
-                    .instructions
-            } else {
-                info!("Using native program analysis");
-                analyze_native_program(program_data, program_id, &parsed_instructions, &blocks, &functions)?
-                    .instructions
-            }
-        } else {
-            warn!("Failed to get text section, using fallback analysis");
-            // Fallback: create a generic instruction
-            let mut instruction = Instruction::new("process".to_string(), 0);
-            instruction.add_arg("data".to_string(), "bytes".to_string());
-            instruction.add_account("authority".to_string(), true, false, false);
-            instruction.add_account("data".to_string(), false, true, false);
-            vec![instruction]
-        }
-    };
-    
-    // Extract accounts using disassembler if available, otherwise fall back to account_analyzer
-    let accounts = if let Some(disassembled) = &disassembled {
-        info!("Extracting accounts from disassembled program");
-        disassembler::extract_accounts(disassembled, program_id)
-    } else {
-        info!("Falling back to account analyzer");
-        // Extract accounts using traditional methods
-        if let Ok(Some(text)) = elf_analyzer.get_text_section() {
-            let parsed_instructions = parser::parse_instructions(&text.data, text.address as usize)?;
-            let discriminators = discriminator_detection::extract_discriminators(program_data)?;
-            account_analyzer::extract_account_structures(program_data, &parsed_instructions, &discriminators)?
-        } else {
-            warn!("Failed to get text section, using fallback account analysis");
-            // Fallback: create a generic account
-            let mut account = Account::new("State".to_string(), "state".to_string());
-            account.add_field("data".to_string(), "bytes".to_string(), 0);
-            vec![account]
-        }
-    };
-    
-    // Extract error codes
-    let error_codes = if is_anchor {
-        // Use Anchor-specific error code extraction
-        crate::analyzer::anchor::extract_custom_error_codes(program_data)
-            .unwrap_or_default()
-    } else {
-        // Extract error codes from strings in the program
-        let mut codes = HashMap::new();
-        
-        // Try to extract error strings from the program
-        if let Ok(Some(rodata)) = elf_analyzer.get_rodata_section() {
-            let strings = pattern::extract_strings(&rodata.data);
-            for (i, string) in strings.iter().enumerate() {
-                if string.contains("error") || string.contains("Error") {
-                    codes.insert(6000 + i as u32, string.clone());
-                }
-            }
-        }
-        
-        codes
-    };
-    
-    // Extract arguments for each instruction
-    for instruction in &mut instructions {
-        // Use the instruction index as the entrypoint
-        let args = dynamic_analysis::extract_args(program_data, instruction.index as usize);
-        instruction.args = args;
+        info!("Detected native Solana program, using general analysis");
+        analyze_native_program(program_data, program_id, &instructions, &blocks, &functions)
     }
-    
-    Ok(BytecodeAnalysis {
-        instructions,
-        accounts,
-        error_codes,
-        is_anchor,
-        disassembled,
-    })
 }
 
 /// Analyze an Anchor program
@@ -270,9 +188,9 @@ fn analyze_anchor_program(
     
     // Extract accounts
     let accounts = account_analyzer::extract_account_structures(
-        program_data, 
-        parsed_instructions, 
-        &discriminators
+        program_data,
+        parsed_instructions,
+        &[]  // Empty discriminator list for non-Anchor programs
     )?;
     
     // Extract error codes (using Anchor-specific method)
@@ -296,22 +214,16 @@ fn analyze_native_program(
     blocks: &[cfg::BasicBlock],
     functions: &[cfg::Function],
 ) -> Result<BytecodeAnalysis> {
-    // Extract native program instructions
-    let mut instructions = Vec::new();
-    
-    // Identify instruction boundaries using our new function
+    // Find instruction entry points
     let instruction_entries = identify_instruction_boundaries(parsed_instructions, blocks, program_data);
     
-    // Create instructions from identified entry points
+    // Create instructions based on entry points
+    let mut program_instructions = Vec::new();
+    
     for (i, &entry_point) in instruction_entries.iter().enumerate() {
-        // Try to find a meaningful name for this instruction
-        let name = if entry_point < parsed_instructions.len() {
-            // Look for nearby string references or syscalls to infer purpose
-            infer_instruction_name(parsed_instructions, entry_point, program_data)
-                .unwrap_or_else(|| format!("instruction_{}", i))
-        } else {
-            format!("instruction_{}", i)
-        };
+        // Try to infer a meaningful name for this instruction
+        let name = infer_instruction_name(parsed_instructions, entry_point, program_data)
+            .unwrap_or_else(|| format!("instruction_{}", i));
         
         let mut instruction = Instruction::new(name, i as u8);
         
@@ -322,68 +234,45 @@ fn analyze_native_program(
         instruction.add_account("authority".to_string(), true, false, false);
         instruction.add_account("data".to_string(), false, true, false);
         
-        // Add instruction to list
-        instructions.push(instruction);
+        program_instructions.push(instruction);
     }
     
-    // If we still don't have any instructions, fall back to the function-based approach
-    if instructions.is_empty() {
-        // For each function that looks like an entry point, create an instruction
-        for (i, function) in functions.iter().enumerate() {
-            // Check if this is likely an entry point function
-            if blocks[function.entry_block].is_function_entry() {
-                let name = function.name.clone().unwrap_or_else(|| format!("function_{}", function.id));
-                let mut instruction = Instruction::new(name, i as u8);
-                
-                // Add generic arguments
-                instruction.add_arg("data".to_string(), "bytes".to_string());
-                
-                // Add standard accounts
-                instruction.add_account("authority".to_string(), true, false, false);
-                instruction.add_account("data".to_string(), false, true, false);
-                
-                // Add instruction to list
-                instructions.push(instruction);
-            }
-        }
-    }
-    
-    // If still no instructions found, add a generic one
-    if instructions.is_empty() {
+    // If we couldn't find any instructions, add a generic one
+    if program_instructions.is_empty() {
         let mut instruction = Instruction::new("process".to_string(), 0);
         instruction.add_arg("data".to_string(), "bytes".to_string());
         instruction.add_account("authority".to_string(), true, false, false);
         instruction.add_account("data".to_string(), false, true, false);
-        instructions.push(instruction);
+        program_instructions.push(instruction);
     }
     
     // Extract accounts
     let accounts = account_analyzer::extract_account_structures(
-        program_data, 
-        parsed_instructions, 
-        &[]
+        program_data,
+        parsed_instructions,
+        &[]  // Empty discriminator list for non-Anchor programs
     )?;
     
     // Extract error codes
-    let mut error_codes = HashMap::new();
+    let error_codes = error_analyzer::extract_error_codes(parsed_instructions)
+        .unwrap_or_default();
     
-    // Try to extract error strings from the program
-    if let Ok(Some(rodata)) = elf::ElfAnalyzer::from_bytes(program_data.to_vec())?.get_rodata_section() {
-        let strings = pattern::extract_strings(&rodata.data);
-        for (i, string) in strings.iter().enumerate() {
-            if string.contains("error") || string.contains("Error") {
-                error_codes.insert(6000 + i as u32, string.clone());
-            }
-        }
-    }
-    
-    Ok(BytecodeAnalysis {
-        instructions,
+    // Create analysis result
+    let analysis = BytecodeAnalysis {
+        instructions: program_instructions,
         accounts,
         error_codes,
         is_anchor: false,
         disassembled: None,
-    })
+    };
+    
+    info!("Bytecode analysis complete, found {} instructions, {} accounts, {} error codes",
+        analysis.instructions.len(),
+        analysis.accounts.len(),
+        analysis.error_codes.len()
+    );
+    
+    Ok(analysis)
 }
 
 /// Enhanced instruction boundary identification with more sophisticated heuristics
@@ -496,7 +385,7 @@ fn infer_instruction_name(
     let instruction_window = &instructions[entry_point..entry_point + window_size];
     
     // Look for string loading patterns
-    for (i, insn) in instruction_window.iter().enumerate() {
+    for (_i, insn) in instruction_window.iter().enumerate() {
         if insn.is_load_imm() && insn.imm > 0 {
             // This might be loading a string pointer
             let potential_str_addr = insn.imm as usize;
