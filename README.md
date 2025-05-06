@@ -121,13 +121,9 @@ Solana IDL Extractor uses several techniques to analyze Solana programs:
 
 ## License
 
-This project is licensed under either of:
+This project is licensed under MIT License
 
-- MIT License
-- Apache License, Version 2.0
-
-at your option.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request!
