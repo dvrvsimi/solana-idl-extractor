@@ -105,6 +105,7 @@ where
         // Check if endpoint is healthy
         match check_endpoint_health(endpoint).await {
             Ok(true) => {
+                log::info!("Endpoint {} is healthy, trying operation", endpoint);
                 match operation(endpoint).await {
                     Ok(result) => return Ok(result),
                     Err(e) => {
@@ -113,8 +114,11 @@ where
                     }
                 }
             },
-            _ => {
+            Ok(false) => {
                 log::warn!("Endpoint {} is not healthy, skipping", endpoint);
+            },
+            Err(e) => {
+                log::warn!("Failed to check health of endpoint {}: {}", endpoint, e);
             }
         }
     }
@@ -145,11 +149,14 @@ pub async fn get_recent_blockhash(rpc_client: &RpcClient) -> Result<String> {
     let mut retry_delay = 500; // Start with 500ms
     let mut last_error = None;
     
+    // Use the RPC client's URL - store it as a reference to avoid moving it
+    let rpc_url = rpc_client.url();
+    
     for attempt in 1..=5 {
         log::info!("Fetching recent blockhash, attempt {}/5", attempt);
         
-        // Send request
-        match HTTP_CLIENT.post(rpc_client.url())
+        // Send request using the RPC client's URL - use a reference to avoid moving it
+        match HTTP_CLIENT.post(&rpc_url)
             .json(&request)
             .send()
             .await {
@@ -226,7 +233,9 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
         ]
     });
     
-    log::info!("RPC: Sending getAccountInfo request to {}", rpc_client.url());
+    // Store the URL as a reference to avoid moving it
+    let rpc_url = rpc_client.url();
+    log::info!("RPC: Sending getAccountInfo request to {}", rpc_url);
     
     // Try up to 3 times with exponential backoff
     let mut retry_delay = 1000; // Start with 1 second
@@ -235,19 +244,16 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
     for attempt in 1..=3 {
         log::info!("RPC: Fetching program data, attempt {}/3", attempt);
         
-        // Send request
-        match HTTP_CLIENT.post(rpc_client.url())
+        // Send request - use a reference to avoid moving the URL
+        match HTTP_CLIENT.post(&rpc_url)
             .json(&request)
             .send()
             .await {
                 Ok(response) => {
-                    log::info!("RPC: Received response from {}", rpc_client.url());
+                    log::info!("RPC: Received response from {}", rpc_url);
                     
                     match response.json::<serde_json::Value>().await {
                         Ok(json_response) => {
-                            // Log the raw response for debugging
-                            log::debug!("RPC: Raw response: {}", serde_json::to_string(&json_response).unwrap_or_default());
-                            
                             // Check for RPC error
                             if let Some(error) = json_response.get("error") {
                                 last_error = Some(anyhow!("RPC error: {}", error));
@@ -270,49 +276,105 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                     
                                     match base64::decode(data_str) {
                                         Ok(data) => {
-                                            // Check if this is a program account
-                                            let executable = result.get("executable")
-                                                .and_then(|e| e.as_bool())
-                                                .unwrap_or(false);
+                                            // Get the owner of this account
+                                            let owner = result.get("owner")
+                                                .and_then(|o| o.as_str())
+                                                .unwrap_or("");
                                                 
-                                            log::info!("RPC: Account executable status: {}", executable);
+                                            log::info!("RPC: Account owner: {}", owner);
                                             
-                                            if !executable {
-                                                log::warn!("RPC: Account is not executable (not a program)");
-                                                
-                                                // Check if this is a BPF Upgradeable Loader account
-                                                let owner = result.get("owner")
-                                                    .and_then(|o| o.as_str())
-                                                    .unwrap_or("");
-                                                
-                                                log::info!("RPC: Account owner: {}", owner);
-                                                
-                                                if owner == "BPFLoaderUpgradeab1e1111111111111111111111111" {
-                                                    log::info!("RPC: This is a BPF Upgradeable Loader account, fetching program data");
-                                                    
-                                                    // Parse the program data account address from the data
-                                                    if data.len() >= 36 {
-                                                        // Use a compatible method to create Pubkey
-                                                        let mut program_data_bytes = [0u8; 32];
-                                                        program_data_bytes.copy_from_slice(&data[4..36]);
-                                                        let program_data_address = Pubkey::new_from_array(program_data_bytes);
-                                                        
-                                                        log::info!("RPC: Program data account: {}", program_data_address);
-                                                        
-                                                        // Recursively fetch the program data account
-                                                        return Box::pin(get_program_data(rpc_client, &program_data_address)).await;
-                                                    } else {
-                                                        log::error!("RPC: Data too short for BPF Upgradeable Loader: {} bytes", data.len());
-                                                    }
-                                                } else {
-                                                    log::warn!("RPC: Not a BPF Upgradeable Loader account, owner: {}", owner);
-                                                }
-                                                
-                                                return Err(anyhow!("Account is not executable (not a program)"));
+                                            // Log data size and first few bytes for debugging
+                                            log::info!("RPC: Account data size: {} bytes", data.len());
+                                            if data.len() > 0 {
+                                                let preview_size = std::cmp::min(data.len(), 16);
+                                                let hex_preview = data[..preview_size]
+                                                    .iter()
+                                                    .map(|b| format!("{:02x}", b))
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ");
+                                                log::info!("RPC: First {} bytes: {}", preview_size, hex_preview);
                                             }
                                             
-                                            log::info!("RPC: Successfully fetched program data, size: {} bytes", data.len());
-                                            return Ok(data);
+                                            // Check if this is a BPF Upgradeable Loader account
+                                            if owner == "BPFLoaderUpgradeab1e11111111111111111111111" {
+                                                log::info!("RPC: This is a BPF Upgradeable Loader account");
+                                                
+                                                // Check if this is the program account (36 bytes)
+                                                if data.len() == 36 {
+                                                    log::info!("RPC: This is a program account (36 bytes), extracting program data account address");
+                                                    
+                                                    // Parse the program data account address from the data
+                                                    let mut program_data_bytes = [0u8; 32];
+                                                    program_data_bytes.copy_from_slice(&data[4..36]);
+                                                    let program_data_address = Pubkey::new_from_array(program_data_bytes);
+                                                    
+                                                    log::info!("RPC: Program data account: {}", program_data_address);
+                                                    
+                                                    // Recursively fetch the program data account
+                                                    match Box::pin(get_program_data(rpc_client, &program_data_address)).await {
+                                                        Ok(program_data) => {
+                                                            log::info!("RPC: Successfully fetched program data from program data account ({} bytes)", program_data.len());
+                                                            if program_data.len() > 0 {
+                                                                let preview_size = std::cmp::min(program_data.len(), 16);
+                                                                let hex_preview = program_data[..preview_size]
+                                                                    .iter()
+                                                                    .map(|b| format!("{:02x}", b))
+                                                                    .collect::<Vec<_>>()
+                                                                    .join(" ");
+                                                                log::info!("RPC: First {} bytes of program data: {}", preview_size, hex_preview);
+                                                            }
+                                                            return Ok(program_data);
+                                                        },
+                                                        Err(e) => {
+                                                            log::error!("RPC: Failed to fetch program data from program data account: {}", e);
+                                                            return Err(e);
+                                                        }
+                                                    }
+                                                } 
+                                                // Check if this is the program data account (contains the actual program)
+                                                else {
+                                                    log::info!("RPC: This is a program data account ({} bytes)", data.len());
+                                                    
+                                                    // The program data account has a header before the actual program binary
+                                                    // The header is 8 bytes: 1 byte slot + 7 bytes upgrade authority info
+                                                    if data.len() > 8 {
+                                                        log::info!("RPC: Extracting program binary from program data account (skipping 8-byte header)");
+                                                        let program_data = data[8..].to_vec();
+                                                        
+                                                        // Log the first few bytes of the actual program binary
+                                                        if program_data.len() > 0 {
+                                                            let preview_size = std::cmp::min(program_data.len(), 16);
+                                                            let hex_preview = program_data[..preview_size]
+                                                                .iter()
+                                                                .map(|b| format!("{:02x}", b))
+                                                                .collect::<Vec<_>>()
+                                                                .join(" ");
+                                                            log::info!("RPC: First {} bytes of program binary: {}", preview_size, hex_preview);
+                                                        }
+                                                        
+                                                        return Ok(program_data);
+                                                    } else {
+                                                        log::error!("RPC: Program data account too small: {} bytes", data.len());
+                                                        return Err(anyhow!("Program data account too small"));
+                                                    }
+                                                }
+                                            } 
+                                            // Check if this is a regular executable program
+                                            else {
+                                                let executable = result.get("executable")
+                                                    .and_then(|e| e.as_bool())
+                                                    .unwrap_or(false);
+                                                    
+                                                log::info!("RPC: Account executable status: {}", executable);
+                                                
+                                                if executable {
+                                                    log::info!("RPC: This is a regular executable program");
+                                                    return Ok(data);
+                                                } else {
+                                                    log::warn!("RPC: Account is not executable and not owned by BPF Upgradeable Loader");
+                                                    return Err(anyhow!("Account is not executable and not owned by BPF Upgradeable Loader"));
+                                                }
+                                            }
                                         },
                                         Err(e) => {
                                             last_error = Some(anyhow!("Failed to decode base64 data: {}", e));
@@ -322,8 +384,6 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                 } else {
                                     last_error = Some(anyhow!("Invalid account data format"));
                                     log::warn!("RPC: Invalid account data format on attempt {}", attempt);
-                                    // Log the actual structure we received
-                                    log::debug!("RPC: Result structure: {}", serde_json::to_string(result).unwrap_or_default());
                                 }
                             } else {
                                 last_error = Some(anyhow!("Account not found or empty result"));
@@ -373,8 +433,11 @@ pub async fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey
         ]
     });
     
+    // Store the URL as a reference to avoid moving it
+    let rpc_url = rpc_client.url();
+    
     // Send request to get signatures
-    let signatures_response = HTTP_CLIENT.post(rpc_client.url())
+    let signatures_response = HTTP_CLIENT.post(&rpc_url)
         .json(&signatures_request)
         .send()
         .await?
@@ -429,8 +492,8 @@ pub async fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey
             ]
         });
         
-        // Send request
-        let response = HTTP_CLIENT.post(rpc_client.url())
+        // Send request - use a reference to avoid moving the URL
+        let response = HTTP_CLIENT.post(&rpc_url)
             .json(&tx_request)
             .send()
             .await?;
@@ -470,5 +533,15 @@ pub async fn get_recent_transactions(rpc_client: &RpcClient, program_id: &Pubkey
 
 /// Get account info for the given account ID
 pub fn get_account_info(rpc_client: &RpcClient, account_id: &Pubkey) -> Result<solana_account::Account> {
-    Ok(rpc_client.get_account(account_id)?)
+    log::info!("Fetching account info for: {}", account_id);
+    match rpc_client.get_account(account_id) {
+        Ok(account) => {
+            log::info!("Successfully fetched account info, data size: {} bytes", account.data.len());
+            Ok(account)
+        },
+        Err(e) => {
+            log::error!("Failed to fetch account info: {}", e);
+            Err(anyhow!("Failed to fetch account info: {}", e))
+        }
+    }
 } 

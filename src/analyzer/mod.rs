@@ -17,6 +17,7 @@ use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
 use crate::errors::AnalyzerError;
+use crate::utils::get_program_elf_bytes;
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -42,21 +43,14 @@ impl Analyzer {
         }
         log::info!("Analyzing bytecode for program: {}", program_id);
         
-        // Get program data
-        let program_data = monitor.get_program_data(program_id).await
-            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-                program_id: Some(program_id.to_string()),
-                component: "analyzer".to_string(),
-                operation: "analyze_bytecode".to_string(),
-                details: Some("get_program_data".to_string()),
-            }))?;
+        // Get program ELF data robustly (handles upgradeable/non-upgradeable)
+        let elf_bytes = monitor.get_program_data(program_id).await?;
         
-        log::debug!("Received program data, size: {} bytes", program_data.len());
+        log::debug!("Received program data, size: {} bytes", elf_bytes.len());
         
         // Check if this looks like valid ELF data
-        if program_data.len() >= 4 && program_data[0] == 0x7F && program_data[1] == b'E' && program_data[2] == b'L' && program_data[3] == b'F' {
-            // Check if this is an Anchor program early
-            let is_anchor = anchor::is_anchor_program(&program_data);
+        if elf_bytes.len() >= 4 && elf_bytes[0] == 0x7F && elf_bytes[1] == b'E' && elf_bytes[2] == b'L' && elf_bytes[3] == b'F' {
+            let is_anchor = anchor::is_anchor_program(&elf_bytes);
             if is_anchor {
                 log::info!("Detected Anchor program");
             } else {
@@ -67,7 +61,7 @@ impl Analyzer {
         }
         
         // Analyze bytecode
-        let result = bytecode::analyze(&program_data, &program_id.to_string())
+        let result = bytecode::analyze(&elf_bytes, &program_id.to_string())
             .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
                 program_id: Some(program_id.to_string()),
                 component: "analyzer".to_string(),
@@ -264,11 +258,11 @@ impl Analyzer {
 }
 
 /// Analyze a Solana program and extract its IDL
-pub fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
+pub async fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
     log::info!("Analyzing program: {}", program_id);
     
     // Get program data
-    let program_data = get_program_data(rpc_client, program_id)?;
+    let program_data = get_program_data(rpc_client, program_id).await?;
     
     // Check if this is an Anchor program
     let is_anchor = anchor::is_anchor_program(&program_data);
@@ -390,17 +384,28 @@ pub fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClien
 }
 
 /// Get program data from the blockchain
-fn get_program_data(rpc_client: &RpcClient, program_id: &solana_pubkey::Pubkey) -> ExtractorResult<Vec<u8>> {
+async fn get_program_data(rpc_client: &RpcClient, program_id: &solana_pubkey::Pubkey) -> ExtractorResult<Vec<u8>> {
     log::info!("Fetching program data for: {}", program_id);
     
-    // Get account data
-    let account = rpc_client.get_account(program_id)
-        .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+    // Create a monitor to use the robust implementation
+    let monitor = match crate::monitor::Monitor::new(rpc_client.url().as_str()).await {
+        Ok(m) => m,
+        Err(e) => return Err(ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+            program_id: Some(program_id.to_string()),
+            component: "analyzer".to_string(),
+            operation: "get_program_data".to_string(),
+            details: Some("create_monitor".to_string()),
+        })),
+    };
+    
+    // Use the monitor's implementation which correctly handles BPF upgradeable loader accounts
+    match monitor.get_program_data(program_id).await {
+        Ok(data) => Ok(data),
+        Err(e) => Err(ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
             program_id: Some(program_id.to_string()),
             component: "analyzer".to_string(),
             operation: "get_program_data".to_string(),
             details: None,
-        }))?;
-    
-    Ok(account.data)
+        })),
+    }
 }

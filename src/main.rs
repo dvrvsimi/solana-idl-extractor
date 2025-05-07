@@ -4,7 +4,7 @@ use solana_pubkey::Pubkey;
 use std::path::PathBuf;
 use std::str::FromStr;
 use env_logger::Builder;
-use log::{LevelFilter, info};
+use log::LevelFilter;
 use std::io::Write;
 
 // Simple CLI without clap
@@ -67,17 +67,31 @@ async fn main() -> Result<()> {
         println!("  --simulate, -s       Enhance IDL with transaction simulation");
         println!("  --clear-cache        Clear the cache for all programs or a specific program");
         println!("  --version, -v        Show version information");
+        println!("  --file, -f PATH      Use the specified file as the program data");
         return Ok(());
     }
     
     let program_id_str = &args[1];
-    let program_id = Pubkey::from_str(program_id_str)?;
+    let program_id = match Pubkey::from_str(program_id_str) {
+        Ok(id) => id,
+        Err(e) => {
+            // If we're using a file, we can use a dummy program ID
+            if args.len() > 2 && (args[2] == "--file" || args[2] == "-f") {
+                // Use a dummy program ID for file analysis
+                Pubkey::new_unique()
+            } else {
+                // Otherwise, return the error
+                return Err(anyhow::anyhow!("Invalid program ID: {}", e));
+            }
+        }
+    };
     
     // Parse optional arguments
     let mut output_path = None;
     let mut cluster = "https://api.mainnet-beta.solana.com".to_string();
     let mut no_cache = false;
     let mut simulate = false;
+    let mut file_path = None;
     
     let mut i = 2;
     while i < args.len() {
@@ -100,6 +114,15 @@ async fn main() -> Result<()> {
                     return Ok(());
                 }
             },
+            "--file" | "-f" => {
+                if i + 1 < args.len() {
+                    file_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    println!("Error: Missing value for --file");
+                    return Ok(());
+                }
+            },
             "--no-cache" => {
                 no_cache = true;
                 i += 1;
@@ -119,7 +142,38 @@ async fn main() -> Result<()> {
     println!("Extracting IDL for program: {}", program_id);
     
     // Extract IDL
-    let idl = if simulate {
+    let idl = if let Some(path) = file_path {
+        println!("Using local file: {}", path.display());
+        // Read the file
+        let program_data = std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", path.display(), e))?;
+        
+        // Analyze the program data directly
+        let bytecode_analysis = solana_idl_extractor::analyzer::bytecode::analyze(&program_data, &program_id.to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to analyze bytecode: {}", e))?;
+        
+        // Create a basic IDL
+        let mut idl = solana_idl_extractor::models::idl::IDL::new(
+            format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+            program_id.to_string()
+        );
+        
+        // Add instructions
+        for instruction in bytecode_analysis.instructions {
+            idl.add_instruction(instruction);
+        }
+        
+        // Add accounts
+        for account in bytecode_analysis.accounts {
+            idl.add_account(account);
+        }
+        
+        // Set metadata
+        idl.metadata.address = program_id.to_string();
+        idl.metadata.origin = "file".to_string();
+        
+        idl
+    } else if simulate {
         println!("Using transaction simulation to enhance IDL...");
         extract_idl_with_simulation(&program_id, &cluster, output_path.as_deref(), !no_cache).await?
     } else {
