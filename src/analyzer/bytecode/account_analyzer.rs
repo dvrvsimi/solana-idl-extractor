@@ -8,6 +8,20 @@ use super::parser::{SbfInstruction, parse_instructions};
 use super::elf::ElfAnalyzer;
 use super::discriminator_detection::{AnchorDiscriminator, DiscriminatorKind};
 use crate::utils::hash::generate_anchor_account_discriminator;
+use crate::utils::account_analysis::{
+    is_account_validation,
+    is_account_ownership_check,
+    is_account_data_access,
+    get_account_size,
+    is_account_constraint_check,
+};
+use solana_sbpf::{
+    elf::Executable,
+    program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+    static_analysis::Analysis,
+    test_utils::TestContextObject,
+};
+use std::sync::Arc;
 
 /// Field access information
 #[derive(Debug, Clone)]
@@ -35,27 +49,38 @@ struct MemoryAccessPattern {
     is_account: bool,
 }
 
-/// Enhanced account structure extraction
+/// Enhanced account structure extraction using SBPF analysis
 pub fn extract_account_structures(
     program_data: &[u8],
     instructions: &[SbfInstruction],
     discriminators: &[AnchorDiscriminator]
 ) -> Result<Vec<Account>> {
-    info!("Performing enhanced account structure extraction");
+    info!("Performing enhanced account structure extraction with SBPF analysis");
+    
+    // Create SBPF executable for better analysis
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        program_data,
+        Arc::new(BuiltinProgram::new_mock()),
+        SBPFVersion::V3,
+        FunctionRegistry::default(),
+    ).map_err(|e| anyhow!("Failed to create executable: {}", e))?;
+
+    let analysis = Analysis::from_executable(&executable)
+        .map_err(|e| anyhow!("Failed to analyze executable: {}", e))?;
     
     // First try to extract from discriminators (for Anchor programs)
     let mut accounts = extract_accounts_from_discriminators(discriminators);
     
-    // If we found accounts from discriminators, enhance them with field analysis
+    // If we found accounts from discriminators, enhance them with SBPF analysis
     if !accounts.is_empty() {
-        enhance_accounts_with_field_analysis(&mut accounts, instructions);
+        enhance_accounts_with_sbpf_analysis(&mut accounts, &analysis, instructions);
     } else {
-        // If no accounts from discriminators, try memory access patterns
-        accounts = extract_accounts_from_memory_patterns(program_data, instructions)?;
+        // If no accounts from discriminators, try SBPF memory analysis
+        accounts = extract_accounts_from_sbpf_analysis(&analysis, instructions)?;
     }
     
-    // Analyze account relationships
-    analyze_account_relationships(&mut accounts, instructions);
+    // Analyze account relationships using SBPF analysis
+    analyze_account_relationships(&mut accounts, &analysis, instructions);
     
     // If we still don't have accounts, add a generic one
     if accounts.is_empty() {
@@ -65,6 +90,94 @@ pub fn extract_account_structures(
     }
     
     Ok(accounts)
+}
+
+/// Extract accounts from SBPF analysis
+fn extract_accounts_from_sbpf_analysis(
+    analysis: &Analysis,
+    instructions: &[SbfInstruction]
+) -> Result<Vec<Account>> {
+    let mut accounts = Vec::new();
+    let mut memory_patterns = HashMap::new();
+    
+    // Track memory access patterns using SBPF analysis
+    for (pc, insn) in analysis.instructions.iter().enumerate() {
+        let instruction = &instructions[pc];
+        
+        // Use our utility functions for better account detection
+        if is_account_data_access(instruction) {
+            let base_reg = instruction.src_reg;
+            let offset = instruction.offset as usize;
+            let size = get_account_size(instruction).unwrap_or(0);
+            
+            // Skip small offsets which are likely instruction data
+            if offset < 8 && base_reg == 2 {
+                continue;
+            }
+            
+            // Record this memory access
+            let pattern = memory_patterns.entry(base_reg).or_insert_with(Vec::new);
+            pattern.push((offset, size, instruction.is_store(), pc));
+        }
+    }
+    
+    // Analyze patterns to identify accounts
+    for (reg, accesses) in memory_patterns {
+        // Sort by offset
+        let mut sorted_accesses = accesses.clone();
+        sorted_accesses.sort_by_key(|a| a.0);
+        
+        // Check if this looks like an account using SBPF analysis
+        if is_likely_account_pattern(&sorted_accesses, analysis) {
+            let account_name = determine_account_name(reg, &sorted_accesses, instructions, analysis);
+            let mut account = Account::new(account_name, "account".to_string());
+            
+            // Add fields based on access patterns
+            let fields = extract_fields_from_accesses(&sorted_accesses, analysis);
+            for (name, ty, offset) in fields {
+                account.add_field(name, ty, offset);
+            }
+            
+            accounts.push(account);
+        }
+    }
+    
+    Ok(accounts)
+}
+
+/// Check if a memory access pattern is likely an account using SBPF analysis
+fn is_likely_account_pattern(
+    accesses: &[(usize, usize, bool, usize)],
+    analysis: &Analysis
+) -> bool {
+    // Use SBPF analysis to improve account detection
+    
+    // 1. Check for syscall-based account operations
+    let has_syscalls = accesses.iter().any(|(_, _, _, pc)| {
+        let insn = &analysis.instructions[*pc];
+        insn.opc == 0x85 && insn.imm >= 0x100000
+    });
+    
+    // 2. Check for account validation patterns
+    let has_validation = accesses.iter().any(|(_, _, _, pc)| {
+        let insn = &analysis.instructions[*pc];
+        is_account_validation(&SbfInstruction::from_sbpf(insn))
+    });
+    
+    // 3. Check for ownership checks
+    let has_ownership = accesses.iter().any(|(_, _, _, pc)| {
+        let insn = &analysis.instructions[*pc];
+        is_account_ownership_check(&SbfInstruction::from_sbpf(insn))
+    });
+    
+    // 4. Check for constraint validation
+    let has_constraints = accesses.iter().any(|(_, _, _, pc)| {
+        let insn = &analysis.instructions[*pc];
+        is_account_constraint_check(&SbfInstruction::from_sbpf(insn))
+    });
+    
+    // Return true if it matches enough SBPF-based heuristics
+    has_syscalls || has_validation || (has_ownership && has_constraints) || accesses.len() >= 5
 }
 
 /// Extract accounts from Anchor discriminators
@@ -91,94 +204,12 @@ fn extract_accounts_from_discriminators(discriminators: &[AnchorDiscriminator]) 
     accounts
 }
 
-/// Extract accounts from memory access patterns
-fn extract_accounts_from_memory_patterns(
-    program_data: &[u8],
-    instructions: &[SbfInstruction]
-) -> Result<Vec<Account>> {
-    let mut accounts = Vec::new();
-    let mut memory_patterns = HashMap::new();
-    
-    // Track memory access patterns
-    for (i, insn) in instructions.iter().enumerate() {
-        if insn.is_load() || insn.is_store() {
-            let base_reg = insn.src_reg;
-            let offset = insn.offset as usize;
-            let size = insn.size;
-            
-            // Skip small offsets which are likely instruction data
-            if offset < 8 && base_reg == 2 {
-                continue;
-            }
-            
-            // Record this memory access
-            let pattern = memory_patterns.entry(base_reg).or_insert_with(Vec::new);
-            pattern.push((offset, size, insn.is_store(), i));
-        }
-    }
-    
-    // Analyze patterns to identify accounts
-    for (reg, accesses) in memory_patterns {
-        // Sort by offset
-        let mut sorted_accesses = accesses.clone();
-        sorted_accesses.sort_by_key(|a| a.0);
-        
-        // Check if this looks like an account
-        if is_likely_account_pattern(&sorted_accesses) {
-            let account_name = determine_account_name(reg, &sorted_accesses, instructions);
-            let mut account = Account::new(account_name, "account".to_string());
-            
-            // Add fields based on access patterns
-            let fields = extract_fields_from_accesses(&sorted_accesses);
-            for (name, ty, offset) in fields {
-                account.add_field(name, ty, offset);
-            }
-            
-            accounts.push(account);
-        }
-    }
-    
-    Ok(accounts)
-}
-
-/// Check if a memory access pattern is likely an account
-fn is_likely_account_pattern(accesses: &[(usize, usize, bool, usize)]) -> bool {
-    // Heuristics to identify accounts:
-    
-    // 1. Has multiple field accesses
-    if accesses.len() < 2 {
-        return false;
-    }
-    
-    // 2. Has a discriminator (first 8 bytes) access for Anchor accounts
-    let has_discriminator = accesses.iter().any(|(offset, size, _, _)| 
-        *offset == 0 && *size == 8
-    );
-    
-    // 3. Has consistent field access patterns
-    let mut prev_offset = 0;
-    let mut consistent_offsets = true;
-    
-    for (i, (offset, size, _, _)) in accesses.iter().enumerate() {
-        if i > 0 && *offset != prev_offset + accesses[i-1].1 && *offset != prev_offset {
-            consistent_offsets = false;
-            break;
-        }
-        prev_offset = *offset;
-    }
-    
-    // 4. Has pubkey-sized accesses (32 bytes)
-    let has_pubkey = accesses.iter().any(|(_, size, _, _)| *size == 32);
-    
-    // Return true if it matches enough heuristics
-    has_discriminator || (consistent_offsets && has_pubkey) || accesses.len() >= 5
-}
-
 /// Determine account name from access pattern
 fn determine_account_name(
     reg: u8,
     accesses: &[(usize, usize, bool, usize)],
-    instructions: &[SbfInstruction]
+    instructions: &[SbfInstruction],
+    analysis: &Analysis
 ) -> String {
     // Try to find nearby string references that might indicate the account name
     for &(_, _, _, insn_idx) in accesses {
@@ -201,7 +232,7 @@ fn determine_account_name(
 }
 
 /// Extract fields from memory accesses
-fn extract_fields_from_accesses(accesses: &[(usize, usize, bool, usize)]) -> Vec<(String, String, usize)> {
+fn extract_fields_from_accesses(accesses: &[(usize, usize, bool, usize)], analysis: &Analysis) -> Vec<(String, String, usize)> {
     let mut fields = Vec::new();
     let mut current_offset = 0;
     
@@ -242,8 +273,8 @@ fn extract_fields_from_accesses(accesses: &[(usize, usize, bool, usize)]) -> Vec
     fields
 }
 
-/// Enhance accounts with field analysis
-fn enhance_accounts_with_field_analysis(accounts: &mut Vec<Account>, instructions: &[SbfInstruction]) {
+/// Enhance accounts with SBPF analysis
+fn enhance_accounts_with_sbpf_analysis(accounts: &mut Vec<Account>, analysis: &Analysis, instructions: &[SbfInstruction]) {
     for account in accounts.iter_mut() {
         // Skip if account already has fields
         if !account.fields.is_empty() {
@@ -274,8 +305,8 @@ fn enhance_accounts_with_field_analysis(accounts: &mut Vec<Account>, instruction
     }
 }
 
-/// Analyze relationships between accounts
-fn analyze_account_relationships(accounts: &mut Vec<Account>, _instructions: &[SbfInstruction]) {
+/// Analyze relationships between accounts using SBPF analysis
+fn analyze_account_relationships(accounts: &mut Vec<Account>, analysis: &Analysis, instructions: &[SbfInstruction]) {
     // Create a list of mint accounts first
     let mint_accounts: Vec<String> = accounts.iter()
         .filter(|a| a.name.to_lowercase().contains("mint"))

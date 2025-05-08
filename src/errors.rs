@@ -206,6 +206,12 @@ impl ExtractorError {
     }
 }
 
+impl From<anyhow::Error> for ExtractorError {
+    fn from(err: anyhow::Error) -> Self {
+        ExtractorError::BytecodeAnalysis(err.to_string())
+    }
+}
+
 /// Analyzer-specific errors
 #[derive(Debug, Error)]
 pub enum AnalyzerError {

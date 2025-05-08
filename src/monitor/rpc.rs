@@ -335,27 +335,15 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                                 else {
                                                     log::info!("RPC: This is a program data account ({} bytes)", data.len());
                                                     
-                                                    // The program data account has a header before the actual program binary
-                                                    // The header is 8 bytes: 1 byte slot + 7 bytes upgrade authority info
-                                                    if data.len() > 8 {
-                                                        log::info!("RPC: Extracting program binary from program data account (skipping 8-byte header)");
-                                                        let program_data = data[8..].to_vec();
-                                                        
-                                                        // Log the first few bytes of the actual program binary
-                                                        if program_data.len() > 0 {
-                                                            let preview_size = std::cmp::min(program_data.len(), 16);
-                                                            let hex_preview = program_data[..preview_size]
-                                                                .iter()
-                                                                .map(|b| format!("{:02x}", b))
-                                                                .collect::<Vec<_>>()
-                                                                .join(" ");
-                                                            log::info!("RPC: First {} bytes of program binary: {}", preview_size, hex_preview);
+                                                    match crate::utils::find_elf_start(&data) {
+                                                        Ok(offset) => {
+                                                            log::info!("RPC: Found ELF header at offset {}", offset);
+                                                            return Ok(data[offset..].to_vec());
+                                                        },
+                                                        Err(e) => {
+                                                            log::error!("RPC: Failed to find ELF header: {}", e);
+                                                            return Err(anyhow::anyhow!("Failed to find ELF header: {}", e));
                                                         }
-                                                        
-                                                        return Ok(program_data);
-                                                    } else {
-                                                        log::error!("RPC: Program data account too small: {} bytes", data.len());
-                                                        return Err(anyhow!("Program data account too small"));
                                                     }
                                                 }
                                             } 

@@ -3,6 +3,10 @@
 pub mod hash;
 pub mod pattern;
 pub mod transaction_parser;
+pub mod instruction_patterns;
+pub mod memory_analysis;
+pub mod account_analysis;
+pub mod control_flow;
 
 use solana_pubkey::Pubkey;
 
@@ -42,4 +46,34 @@ where
         // Not a program account
         None
     }
+}
+
+/// Find the start of an ELF file in program data
+pub fn find_elf_start(data: &[u8]) -> Result<usize, anyhow::Error> {
+    const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
+    
+    // First try common offsets
+    let offsets = [8, 44, 0];
+    for &offset in &offsets {
+        if data.len() >= offset + 4 && &data[offset..offset + 4] == ELF_MAGIC {
+            log::info!("Found ELF header at offset {}", offset);
+            return Ok(offset);
+        }
+    }
+    
+    // If that fails, scan the entire data
+    for i in 0..data.len().saturating_sub(4) {
+        if &data[i..i + 4] == ELF_MAGIC {
+            log::info!("Found ELF header at offset {} by scanning", i);
+            return Ok(i);
+        }
+    }
+    
+    // If still no ELF header found, try fallback to 8-byte offset
+    if data.len() > 8 {
+        log::warn!("No ELF header found, using fallback offset of 8 bytes");
+        return Ok(8);
+    }
+    
+    Err(anyhow::anyhow!("No ELF header found in program data"))
 }

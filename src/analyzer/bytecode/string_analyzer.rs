@@ -3,6 +3,11 @@
 use anyhow::{Result, anyhow};
 use log::{debug, info};
 use std::collections::HashMap;
+use super::ElfAnalyzer;
+use super::parser;
+use super::cfg;
+use super::parser::parse_instructions;
+
 
 /// String analysis result
 #[derive(Debug, Clone)]
@@ -59,7 +64,7 @@ fn process_string(result: &mut StringAnalysisResult, string: &str) {
     // Check for field name patterns
     if is_likely_field_name(&cleaned) {
         let confidence = calculate_field_name_confidence(&cleaned);
-        result.field_names.insert(cleaned, confidence);
+        result.field_names.insert(cleaned.clone(), confidence);
     }
 }
 
@@ -89,13 +94,16 @@ fn is_likely_instruction_name(string: &str) -> bool {
         "initialize", "create", "update", "delete", "set", "get",
         "add", "remove", "transfer", "mint", "burn", "swap",
         "deposit", "withdraw", "stake", "unstake", "claim",
+        "approve", "revoke", "freeze", "thaw", "close",
+        "redeem", "liquidate", "harvest", "compound",
+        "delegate", "undelegate", "redelegate"
     ];
     
-    // Check if string contains any instruction pattern
+    // Check if string starts with or exactly matches an instruction pattern
     instruction_patterns.iter().any(|&pattern| {
-        string.contains(pattern) || 
-        string.starts_with(pattern) || 
-        string.ends_with(pattern)
+        string == pattern || 
+        string.starts_with(&format!("{}_", pattern)) ||
+        string.starts_with(&format!("{} ", pattern))
     })
 }
 
@@ -290,4 +298,287 @@ fn to_snake_case(s: &str) -> String {
     }
     
     result
+}
+
+
+
+/// Extract string constants from an ELF analyzer
+pub fn extract_string_constants(elf_analyzer: &ElfAnalyzer) -> Result<Vec<String>> {
+    elf_analyzer.extract_strings()
+}
+
+/// Enhanced string analysis
+pub fn enhanced_string_analysis(strings: &[String]) -> Result<StringAnalysisResult> {
+    let mut name_scores = HashMap::new();
+    
+    // 1. Score strings based on naming conventions
+    for string in strings {
+        let mut score = 0.0;
+        
+        // Prefer camelCase or snake_case names (common in Solana programs)
+        if string.chars().any(|c| c.is_lowercase()) && string.chars().any(|c| c.is_uppercase()) {
+            // Likely camelCase
+            score += 0.5;
+        } else if string.contains('_') {
+            // Likely snake_case
+            score += 0.4;
+        }
+        
+        // Prefer strings that look like instruction names
+        if string.starts_with("initialize") || 
+           string.starts_with("create") || 
+           string.starts_with("update") || 
+           string.starts_with("delete") || 
+           string.starts_with("process") ||
+           string.starts_with("transfer") ||
+           string.starts_with("mint") ||
+           string.starts_with("burn") {
+            score += 0.8;
+        }
+        
+        // Penalize strings that are likely error messages
+        if string.contains("error") || 
+           string.contains("failed") || 
+           string.contains("invalid") ||
+           string.contains("expected") {
+            score -= 0.7;
+        }
+        
+        // Penalize overly long strings
+        if string.len() > 30 {
+            score -= 0.3;
+        }
+        
+        // Penalize strings with special characters (except underscores)
+        if string.chars().any(|c| !c.is_alphanumeric() && c != '_') {
+            score -= 0.2;
+        }
+        
+        // Only include strings with positive scores
+        if score > 0.0 {
+            name_scores.insert(string.clone(), score);
+        }
+    }
+    
+    Ok(StringAnalysisResult {
+        instruction_names: name_scores,
+        account_names: HashMap::new(),
+        field_names: HashMap::new(),
+    })
+
+}
+
+/// Analyze string references in the code to find instruction names
+pub fn analyze_instruction_strings(
+    instructions: &[parser::SbfInstruction],
+    string_constants: &[(usize, String)]
+) -> HashMap<String, f64> {
+    let mut instruction_names = HashMap::new();
+    
+    // Look for string loading patterns
+    for window in instructions.windows(3) {
+        // Common pattern: load address, then reference string
+        if window[0].is_load_imm() && window[0].imm > 0 {
+            let potential_addr = window[0].imm as usize;
+            
+            // Check if this address corresponds to a string constant
+            for (addr, string) in string_constants {
+                if *addr == potential_addr || (*addr >= potential_addr && *addr < potential_addr + 100) {
+                    // This instruction is likely loading a string reference
+                    
+                    // Score the string as a potential instruction name
+                    let mut score = 0.5;  // Base score
+                    
+                    // Check if the next instructions use this string in a meaningful way
+                    if window[1].dst_reg == window[0].dst_reg || window[2].dst_reg == window[0].dst_reg {
+                        score += 0.3;  // String is used in subsequent instructions
+                    }
+                    
+                    // Check if the string looks like an instruction name
+                    let lower_string = string.to_lowercase();
+                    if lower_string.contains("instruction") || 
+                       lower_string.contains("command") ||
+                       lower_string.contains("action") {
+                        score += 0.4;
+                    }
+                    
+                    // Check for common instruction name patterns
+                    if lower_string.starts_with("initialize") || 
+                       lower_string.starts_with("create") || 
+                       lower_string.starts_with("update") || 
+                       lower_string.starts_with("delete") || 
+                       lower_string.starts_with("process") {
+                        score += 0.6;
+                    }
+                    
+                    // Store the score for this potential instruction name
+                    instruction_names.insert(string.clone(), score);
+                }
+            }
+        }
+    }
+    
+    instruction_names
+}
+
+
+/// Context-aware string analysis that considers code structure
+pub fn context_aware_string_analysis(
+    program_data: &[u8],
+    functions: &[cfg::Function],
+    blocks: &[cfg::BasicBlock],
+    string_constants: &[(usize, String)]
+) -> HashMap<String, f64> {
+    let mut name_scores = HashMap::new();
+    
+    // Analyze each function
+    for function in functions {
+        // Skip functions without names
+        if let Some(name) = &function.name {
+            // Score the function name
+            let mut score = 0.6;  // Base score for function names
+            
+            // Check if this looks like an instruction handler
+            let lower_name = name.to_lowercase();
+            if lower_name.contains("process") || 
+               lower_name.contains("handle") || 
+               lower_name.contains("instruction") ||
+               lower_name.contains("command") {
+                score += 0.4;
+            }
+            
+            // Check for common instruction name patterns
+            if lower_name.starts_with("initialize") || 
+               lower_name.starts_with("create") || 
+               lower_name.starts_with("update") || 
+               lower_name.starts_with("delete") || 
+               lower_name.starts_with("process") {
+                score += 0.3;
+            }
+            
+            // Store the score
+            name_scores.insert(name.clone(), score);
+        }
+        
+        // Analyze string references within this function
+        let entry_block = &blocks[function.entry_block];
+        for insn_idx in 0..entry_block.instructions.len() {
+            // Skip if out of bounds
+            if insn_idx >= program_data.len() {
+                continue;
+            }
+            
+            // Look for string references near the function entry
+            for (addr, string) in string_constants {
+                let addr_usize = *addr;
+                
+                if addr_usize >= insn_idx && addr_usize < insn_idx + 100 {
+                    // This string is referenced near the function entry
+                    
+                    // Score the string
+                    let mut score = 0.4;  // Base score
+                    
+                    // Check if the string looks like an instruction name
+                    let lower_string = string.to_lowercase();
+                    if lower_string.contains("instruction") || 
+                       lower_string.contains("command") ||
+                       lower_string.contains("action") {
+                        score += 0.3;
+                    }
+                    
+                    // Check for common instruction name patterns
+                    if lower_string.starts_with("initialize") || 
+                       lower_string.starts_with("create") || 
+                       lower_string.starts_with("update") || 
+                       lower_string.starts_with("delete") || 
+                       lower_string.starts_with("process") {
+                        score += 0.5;
+                    }
+                    
+                    // Store the score
+                    name_scores.insert(string.clone(), score);
+                }
+            }
+        }
+    }
+    
+    name_scores
+}
+
+
+/// Improved string analyzer that combines multiple techniques
+pub fn improved_string_analyzer(program_data: &[u8]) -> Result<StringAnalysisResult> {
+    // Get strings from the program
+    let elf_analyzer = ElfAnalyzer::from_bytes(program_data.to_vec())?;
+    let string_constants = elf_analyzer.extract_strings()?;
+    
+    // Convert to the format needed for other functions
+    let indexed_strings: Vec<(usize, String)> = string_constants.iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.clone()))
+        .collect();
+    
+    // Get the text section for instruction analysis
+    let text_section = elf_analyzer.get_text_section()?
+        .ok_or_else(|| anyhow!("No text section found in program"))?;
+    
+    // Parse instructions
+    let instructions = parse_instructions(&text_section.data, text_section.address as usize)?;
+    
+    // Build CFG
+    let (blocks, functions) = cfg::build_cfg(&instructions)?;
+    
+    // Perform multiple types of string analysis
+    let basic_scores = enhanced_string_analysis(&string_constants)?;
+    let instruction_scores = analyze_instruction_strings(&instructions, &indexed_strings);
+    let context_scores = context_aware_string_analysis(program_data, &functions, &blocks, &indexed_strings);
+    
+    // Combine scores from different analyses
+    let mut combined_scores = HashMap::new();
+    
+    // Add scores from basic analysis
+    for (name, score) in basic_scores.instruction_names {
+        combined_scores.insert(name, score);
+    }
+    
+    // Add scores from instruction analysis
+    for (name, score) in instruction_scores {
+        combined_scores.entry(name)
+            .and_modify(|s| *s += score)
+            .or_insert(score);
+    }
+    
+    // Add scores from context analysis
+    for (name, score) in context_scores {
+        combined_scores.entry(name)
+            .and_modify(|s| *s += score)
+            .or_insert(score);
+    }
+    
+    // Filter out low-scoring names
+    let filtered_scores: HashMap<String, f64> = combined_scores.into_iter()
+        .filter(|(name, score)| {
+            // Filter out error messages and other non-instruction strings
+            !name.contains("error") && 
+            !name.contains("failed") && 
+            !name.contains("invalid") &&
+            !name.contains("expected") &&
+            !name.contains("assert") &&
+            !name.contains("overflow") &&
+            !name.contains("attempt") &&
+            !name.contains("panic") &&
+            !name.contains("unwrap") &&
+            name.len() < 40 &&
+            *score > 0.5
+        })
+        .collect();
+    
+    // Create the result
+    let result = StringAnalysisResult {
+        field_names: filtered_scores.clone(),
+        account_names: HashMap::new(),  // You could implement similar analysis for account names
+        instruction_names: filtered_scores,  // Add the missing field
+    };
+    
+    Ok(result)
 } 

@@ -95,4 +95,13 @@
 /// - Stripped binaries contain few or no strings
 /// - Generic names may be misclassified
 /// - Names might be misleading or intentionally obfuscated 
+
+// The program data account layout for BPF Upgradeable Loader is:
+// - First 8 bytes: Header
+// - Remaining bytes: Program binary (ELF file)
+
+// The tool should:
+// 1. Skip the first 8 bytes of the program data account
+// 2. Then try to parse the remaining bytes as an ELF file
+
 pub fn _dummy() {} 

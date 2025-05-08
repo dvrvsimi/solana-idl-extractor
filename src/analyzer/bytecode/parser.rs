@@ -6,9 +6,39 @@
 
 use anyhow::{Result, anyhow, Context};
 use log::{debug, info, warn};
-use std::collections::HashMap;
 use crate::constants::opcodes::opcodes;
-use crate::errors::{ExtractorError, ExtractorResult, ErrorExt, ErrorContext};
+use crate::errors::{ExtractorError, ExtractorResult};
+use solana_sbpf::{
+    elf::Executable,
+    program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
+    static_analysis::Analysis,
+    test_utils::TestContextObject,
+};
+use std::sync::Arc;
+use crate::utils::instruction_patterns::{
+    is_instruction_handler,
+    is_discriminator_check,
+    is_anchor_discriminator,
+    is_syscall,
+    is_account_validation,
+    is_parameter_loading,
+};
+use crate::utils::memory_analysis::{
+    accesses_memory,
+    memory_access_type,
+    mem_size,
+    is_load,
+    is_store,
+};
+
+/// Memory access type for SBF instructions
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MemoryAccessType {
+    /// Load from memory
+    Load,
+    /// Store to memory
+    Store,
+}
 
 /// SBPF version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,23 +53,36 @@ pub enum SbpfVersion {
     V3,
 }
 
-/// SBF instruction
-#[derive(Debug, Clone, Copy)]
+/// SBF instruction class
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InstructionClass {
+    MemoryLoadOr32BitALU = 0,
+    MemoryStoreOr64BitALU = 1,
+    ProductQuotientRemainder = 2,
+    ControlFlow = 3,
+}
+
+/// Enhanced SBF instruction representation
+#[derive(Debug, Clone)]
 pub struct SbfInstruction {
-    /// Instruction opcode
+    /// Instruction class (bits 0-2)
+    pub class: InstructionClass,
+    /// Operation code (bits 3-7)
     pub opcode: u8,
-    /// Destination register
+    /// Destination register (bits 8-11)
     pub dst_reg: u8,
-    /// Source register
+    /// Source register (bits 12-15) 
     pub src_reg: u8,
-    /// Offset
+    /// Offset (bits 16-31)
     pub offset: i16,
-    /// Immediate value
+    /// Immediate value (bits 32-63)
     pub imm: i64,
     /// Size of memory access (1, 2, 4, or 8 bytes)
     pub size: usize,
     /// SBPF version this instruction is from
     pub version: SbpfVersion,
+    /// Whether this is a two-slot instruction
+    pub is_two_slot: bool,
 }
 
 impl SbfInstruction {
@@ -64,27 +107,45 @@ impl SbfInstruction {
             ));
         }
         
-        let opcode = data[0];
-        let dst_reg = (data[1] & 0xf0) >> 4;
-        let src_reg = data[1] & 0x0f;
-        let offset = i16::from_le_bytes([data[2], data[3]]);
-        let imm = i32::from_le_bytes([data[4], data[5], data[6], data[7]]) as i64;
+        // Extract instruction components using bit operations
+        let class = (data[0] & 0x07) as u8; // bits 0-2
+        let opcode = (data[0] >> 3) & 0x1F; // bits 3-7
+        let dst_reg = (data[1] >> 4) & 0x0F; // bits 8-11
+        let src_reg = data[1] & 0x0F; // bits 12-15
+        let offset = i16::from_le_bytes([data[2], data[3]]); // bits 16-31
+        let imm = i32::from_le_bytes([data[4], data[5], data[6], data[7]]) as i64; // bits 32-63
+
+        // Determine if this is a two-slot instruction (LDDW)
+        let is_two_slot = opcode == opcodes::LDDW;
         
+        // Validate instruction class
+        let class = match class {
+            0 => InstructionClass::MemoryLoadOr32BitALU,
+            1 => InstructionClass::MemoryStoreOr64BitALU,
+            2 => InstructionClass::ProductQuotientRemainder,
+            3 => InstructionClass::ControlFlow,
+            _ => return Err(ExtractorError::BytecodeAnalysis(
+                format!("Invalid instruction class {} at address 0x{:x}", class, address)
+            )),
+        };
+
+        // Enhanced size detection based on instruction type
+        let size = match (class, opcode) {
+            (InstructionClass::MemoryLoadOr32BitALU, _) => 4,
+            (InstructionClass::MemoryStoreOr64BitALU, _) => 8,
+            _ => 0,
+        };
+
         Ok(Self {
+            class,
             opcode,
             dst_reg,
             src_reg,
             offset,
             imm,
-            size: match opcode & 0xF8 {
-                0x20 => 1,
-                0x28 => 2,
-                0x30 => 4,
-                0x38 => 8,
-                _ => 0,
-            },
-            version: detect_sbpf_version(data)
-                .unwrap_or(SbpfVersion::V0),
+            size,
+            version: detect_sbpf_version(data).unwrap_or(SbpfVersion::V0),
+            is_two_slot,
         })
     }
     
@@ -268,66 +329,124 @@ impl SbfInstruction {
         self.opcode == opcodes::JEQ_REG ||
         self.opcode == opcodes::JNE_REG
     }
-}
 
-/// Parse instructions from a byte slice with improved error handling.
-///
-/// This function parses a sequence of SBF instructions from binary data,
-/// with support for different SBPF versions and error recovery mechanisms.
-/// It attempts to continue parsing even if some instructions are invalid.
-///
-/// # Arguments
-///
-/// * `data` - The binary data containing SBF instructions.
-/// * `base_address` - The base address of the instructions in memory.
-///
-/// # Returns
-///
-/// A result containing a vector of parsed instructions, or an error
-/// if the data could not be parsed.
-pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<Vec<SbfInstruction>> {
-    let context = ErrorContext {
-        program_id: None,
-        component: "bytecode_parser".to_string(),
-        operation: "parse_instructions".to_string(),
-        details: Some(format!("data_len={}, base_address=0x{:x}", data.len(), base_address)),
-    };
-    
-    let mut instructions = Vec::new();
-    let mut offset = 0;
-    
-    // Try to detect SBPF version from ELF header or instruction patterns
-    let version = detect_sbpf_version(data)
-        .map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to detect SBPF version: {}", e)))?;
-    info!("Detected SBPF version: {:?}", version);
-    
-    // Parse instructions with error recovery
-    while offset + 8 <= data.len() {
-        match SbfInstruction::parse(&data[offset..offset + 8], base_address + offset) {
-            Ok(insn) => {
-                instructions.push(insn);
-            },
-            Err(e) => {
-                // Log the error but continue parsing
-                warn!("Failed to parse instruction at offset 0x{:x}: {}", offset, e);
-                
-                // Try to recover by skipping this instruction
-                if instructions.is_empty() {
-                    // If we haven't parsed any instructions yet, this might not be valid bytecode
-                    return Err(ExtractorError::BytecodeAnalysis(
-                        format!("Failed to parse first instruction: {}", e)
-                    ));
+    /// Get the instruction mnemonic
+    pub fn mnemonic(&self) -> &'static str {
+        match (self.class, self.opcode) {
+            (InstructionClass::MemoryLoadOr32BitALU, opcodes::ADD32_IMM) => "add32",
+            (InstructionClass::MemoryLoadOr32BitALU, opcodes::ADD32_REG) => "add32",
+            // Add all other mnemonics...
+            _ => "unknown"
+        }
+    }
+
+    /// Check if instruction accesses memory
+    pub fn accesses_memory(&self) -> bool {
+        accesses_memory(self)
+    }
+
+    /// Get memory access type if applicable
+    pub fn memory_access_type(&self) -> Option<MemoryAccessType> {
+        memory_access_type(self)
+    }
+
+    /// Check if instruction modifies control flow
+    pub fn modifies_control_flow(&self) -> bool {
+        self.is_jump() || self.is_call() || self.is_exit()
+    }
+
+    /// Get jump target if this is a jump instruction
+    pub fn jump_target(&self, current_address: usize) -> Option<usize> {
+        if self.is_jump() {
+            Some(current_address.wrapping_add(self.offset as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Verify instruction validity
+    pub fn verify(&self) -> Result<(), String> {
+        // Verify register ranges
+        if self.src_reg > 10 {
+            return Err(format!("Invalid source register r{}", self.src_reg));
+        }
+        
+        if self.dst_reg > 9 && !self.is_store() {
+            return Err(format!("Invalid destination register r{}", self.dst_reg));
+        }
+
+        // Verify immediate values
+        match self.opcode {
+            opcodes::SDIV32_IMM | opcodes::SDIV64_IMM |
+            opcodes::UDIV32_IMM | opcodes::UDIV64_IMM => {
+                if self.imm == 0 {
+                    return Err("Division by zero".to_string());
                 }
             }
+            opcodes::LSH32_IMM | opcodes::RSH32_IMM | opcodes::ARSH32_IMM => {
+                if self.imm < 0 || self.imm >= 32 {
+                    return Err(format!("Invalid 32-bit shift amount {}", self.imm));
+                }
+            }
+            opcodes::LSH64_IMM | opcodes::RSH64_IMM | opcodes::ARSH64_IMM => {
+                if self.imm < 0 || self.imm >= 64 {
+                    return Err(format!("Invalid 64-bit shift amount {}", self.imm));
+                }
+            }
+            _ => {}
         }
-        offset += 8;
+
+        Ok(())
     }
+
+    /// Check if this instruction is likely part of an instruction handler
+    pub fn is_instruction_handler(&self) -> bool {
+        is_instruction_handler(self)
+    }
+
+    /// Check if this is a discriminator check
+    pub fn is_discriminator_check(&self) -> bool {
+        is_discriminator_check(self)
+    }
+
+    /// Check if this is an Anchor discriminator check
+    pub fn is_anchor_discriminator(&self) -> bool {
+        is_anchor_discriminator(self)
+    }
+
+    /// Check if this is a syscall
+    pub fn is_syscall(&self) -> bool {
+        is_syscall(self)
+    }
+
+    /// Check if this instruction is part of account validation
+    pub fn is_account_validation(&self) -> bool {
+        is_account_validation(self)
+    }
+
+    /// Check if this instruction is loading parameters
+    pub fn is_parameter_loading(&self) -> bool {
+        is_parameter_loading(self)
+    }
+}
+
+/// Parse instructions using official SBPF tools
+pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<Vec<SbfInstruction>> {
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        data,
+        Arc::new(BuiltinProgram::new_mock()),
+        SBPFVersion::V3,
+        FunctionRegistry::default(),
+    ).map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to create executable: {}", e)))?;
+
+    let analysis = Analysis::from_executable(&executable)
+        .map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to analyze executable: {}", e)))?;
+
+    // Use SBPF's analysis to group instructions into handlers
+    let handlers = group_instruction_handlers(&analysis);
     
-    if instructions.is_empty() {
-        return Err(ExtractorError::BytecodeAnalysis(
-            "No valid instructions found in bytecode".to_string()
-        ));
-    }
+    // Flatten handlers into single instruction list
+    let instructions = handlers.into_iter().flatten().collect();
     
     Ok(instructions)
 }
@@ -485,4 +604,113 @@ fn detect_sbpf_version(data: &[u8]) -> ExtractorResult<SbpfVersion> {
     
     // Default to V0 if no specific features detected
     Ok(SbpfVersion::V0)
+}
+
+/// Analyze program using official SBPF tools
+pub fn analyze_with_sbpf(program_data: &[u8]) -> ExtractorResult<Vec<SbfInstruction>> {
+    // Create executable using official SBPF tools
+    let executable = Executable::<TestContextObject>::from_text_bytes(
+        program_data,
+        Arc::new(BuiltinProgram::new_mock()),
+        SBPFVersion::V3,
+        FunctionRegistry::default(),
+    ).map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to create executable: {}", e)))?;
+
+    // Get analysis from executable
+    let analysis = Analysis::from_executable(&executable)
+        .map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to analyze executable: {}", e)))?;
+
+    // Convert SBPF instructions to our format
+    let mut instructions = Vec::new();
+    for (pc, insn) in analysis.instructions.iter().enumerate() {
+        instructions.push(SbfInstruction {
+            class: match insn.opc & 0x07 {
+                0 => InstructionClass::MemoryLoadOr32BitALU,
+                1 => InstructionClass::MemoryStoreOr64BitALU,
+                2 => InstructionClass::ProductQuotientRemainder,
+                3 => InstructionClass::ControlFlow,
+                _ => return Err(ExtractorError::BytecodeAnalysis(
+                    format!("Invalid instruction class at PC {}: {}", pc, insn.opc)
+                ))
+            },
+            opcode: insn.opc,
+            dst_reg: insn.dst,
+            src_reg: insn.src,
+            offset: insn.off,
+            imm: insn.imm,
+            size: match insn.opc {
+                0x61 => 4,  // ldxw
+                0x69 => 2,  // ldxh
+                0x71 => 1,  // ldxb
+                0x79 => 8,  // ldxdw
+                _ => 0
+            },
+            version: SbpfVersion::V3,
+            is_two_slot: insn.opc == 0x18, // lddw
+        });
+    }
+
+    Ok(instructions)
+}
+
+/// Group instructions into handlers using SBPF analysis
+pub fn group_instruction_handlers(analysis: &Analysis) -> Vec<Vec<SbfInstruction>> {
+    let mut handlers = Vec::new();
+    let mut current_handler = Vec::new();
+    let mut in_handler = false;
+
+    for (pc, insn) in analysis.instructions.iter().enumerate() {
+        let instruction = SbfInstruction {
+            class: match insn.opc & 0x07 {
+                0 => InstructionClass::MemoryLoadOr32BitALU,
+                1 => InstructionClass::MemoryStoreOr64BitALU,
+                2 => InstructionClass::ProductQuotientRemainder,
+                3 => InstructionClass::ControlFlow,
+                _ => continue,
+            },
+            opcode: insn.opc,
+            dst_reg: insn.dst,
+            src_reg: insn.src,
+            offset: insn.off,
+            imm: insn.imm,
+            size: match insn.opc {
+                0x61 => 4,  // ldxw
+                0x69 => 2,  // ldxh
+                0x71 => 1,  // ldxb
+                0x79 => 8,  // ldxdw
+                _ => 0
+            },
+            version: SbpfVersion::V3,
+            is_two_slot: insn.opc == 0x18,
+        };
+
+        // Use instruction patterns to detect handler boundaries
+        if instruction.is_instruction_handler() {
+            if !current_handler.is_empty() {
+                handlers.push(current_handler);
+                current_handler = Vec::new();
+            }
+            in_handler = true;
+        }
+
+        if in_handler {
+            current_handler.push(instruction);
+        }
+
+        // Check for handler end using instruction patterns
+        if instruction.is_exit() {
+            in_handler = false;
+            if !current_handler.is_empty() {
+                handlers.push(current_handler);
+                current_handler = Vec::new();
+            }
+        }
+    }
+
+    // Add final handler if any
+    if !current_handler.is_empty() {
+        handlers.push(current_handler);
+    }
+
+    handlers
 }

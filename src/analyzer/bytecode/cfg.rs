@@ -4,6 +4,11 @@ use anyhow::Result;
 use crate::analyzer::bytecode::parser::SbfInstruction;
 use std::collections::{HashSet, VecDeque};
 use crate::constants::opcodes::opcodes;
+use crate::utils::control_flow::{
+    is_jump, is_call, is_exit, is_branch, is_conditional_branch,
+    branch_target, call_target, analyze_control_flow, find_function_boundaries
+};
+use solana_sbpf::static_analysis::Analysis;
 
 /// Basic block in the control flow graph
 #[derive(Debug, Clone)]
@@ -35,53 +40,41 @@ impl BasicBlock {
         }
     }
     
-    /// Check if this block is a function entry point
+    /// Check if this block is a function entry point using SBPF analysis
     pub fn is_function_entry(&self) -> bool {
-        // Function entry points typically have specific patterns:
-        // 1. They often start with stack setup instructions
-        // 2. They may have no predecessors or special predecessors
-        
         if self.instructions.is_empty() {
             return false;
         }
         
-        // Check for stack setup pattern
-        let first_insns = &self.instructions[..std::cmp::min(3, self.instructions.len())];
+        // Use SBPF's analysis to detect function entry points
+        let first_insn = &self.instructions[0];
         
-        // Look for stack frame setup pattern
-        let has_stack_setup = first_insns.iter().any(|insn| 
-            (insn.is_mov_reg() && insn.dst_reg == 11 && insn.src_reg == 1) || // mov r11, r1 (frame pointer setup)
-            (insn.is_add_imm() && insn.dst_reg == 1 && insn.imm < 0) // add r1, #-X (stack allocation)
-        );
-        
-        // Check for register saving pattern (common in function prologues)
-        let has_register_save = first_insns.iter().any(|insn|
-            insn.is_store() && insn.src_reg == 0 // str rx, [sp, #X]
-        );
-        
-        has_stack_setup || has_register_save || self.predecessors.is_empty()
+        // Function entry points typically:
+        // 1. Start with a call or jump
+        // 2. Have no predecessors
+        // 3. Have specific register setup patterns
+        is_call(first_insn) || 
+        is_jump(first_insn) || 
+        self.predecessors.is_empty() ||
+        (first_insn.is_mov_reg() && first_insn.dst_reg == 11 && first_insn.src_reg == 1)
     }
     
-    /// Check if this block is likely an instruction handler
+    /// Check if this block is likely an instruction handler using SBPF analysis
     pub fn is_instruction_handler(&self) -> bool {
-        // Instruction handlers often:
-        // 1. Start by checking the instruction discriminator
-        // 2. Have conditional branches based on the discriminator
-        
         if self.instructions.len() < 3 {
             return false;
         }
         
-        // Look for discriminator loading pattern
-        // Typically loads first 8 bytes from instruction data
+        // Look for instruction handler patterns:
+        // 1. Load discriminator
+        // 2. Compare discriminator
+        // 3. Branch based on comparison
         let has_discriminator_load = self.instructions.iter().take(5).any(|insn| 
-            (insn.is_load() && insn.src_reg == 2 && insn.offset == 0) || // ldr rx, [r2] (load from instruction data)
-            (insn.is_load() && insn.src_reg == 2 && insn.offset == 4)    // ldr rx, [r2, #4] (load second part)
+            insn.is_load() && insn.src_reg == 2 && insn.offset == 0
         );
         
-        // Look for comparison after loading
         let has_comparison = self.instructions.iter().take(10).any(|insn|
-            insn.is_cmp() || insn.is_branch() // cmp or branch instructions
+            is_conditional_branch(insn)
         );
         
         has_discriminator_load && has_comparison
@@ -105,169 +98,88 @@ pub struct Function {
     pub return_type: Option<String>,
 }
 
-/// Build a control flow graph from instructions
-pub fn build_cfg(instructions: &[SbfInstruction]) -> Result<(Vec<BasicBlock>, Vec<Function>)> {
-    // Find basic block boundaries
-    let mut block_starts = HashSet::new();
-    block_starts.insert(0); // First instruction is always a block start
+/// Build a control flow graph from instructions using SBPF analysis
+pub fn build_cfg(instructions: &[SbfInstruction], analysis: &Analysis) -> Result<(Vec<BasicBlock>, Vec<Function>)> {
+    // Use SBPF's analysis to find function boundaries
+    let function_boundaries = find_function_boundaries(analysis);
     
-    // Find branch targets and instructions after branches
-    for (i, insn) in instructions.iter().enumerate() {
-        if insn.is_branch() {
-            // Branch target is a block start
-            if let Some(target) = insn.branch_target() {
-                if target < instructions.len() {
-                    block_starts.insert(target);
-                }
-            }
-            
-            // Instruction after branch is a block start
-            if i + 1 < instructions.len() {
-                block_starts.insert(i + 1);
-            }
-        }
-        
-        // Call targets are also block starts
-        if insn.is_call() {
-            if let Some(target) = insn.call_target() {
-                if target < instructions.len() {
-                    block_starts.insert(target);
-                }
-            }
-        }
-    }
+    // Use SBPF's analysis to build CFG
+    let cfg = analyze_control_flow(analysis);
     
-    // Create basic blocks
+    // Create basic blocks from CFG
     let mut blocks = Vec::new();
-    let mut block_starts_vec: Vec<usize> = block_starts.into_iter().collect();
-    block_starts_vec.sort();
-    
-    for (i, &start) in block_starts_vec.iter().enumerate() {
-        let end = if i + 1 < block_starts_vec.len() {
-            block_starts_vec[i + 1] - 1
+    for (i, (start, successors)) in cfg.iter().enumerate() {
+        let mut block = BasicBlock::new(i, *start);
+        
+        // Add instructions to block
+        let end = if i + 1 < cfg.len() {
+            cfg[i + 1].0 - 1
         } else {
             instructions.len() - 1
         };
         
-        let mut block = BasicBlock::new(i, start);
         block.end = end;
-        
-        // Add instructions to the block
-        for j in start..=end {
+        for j in *start..=end {
             if j < instructions.len() {
                 block.instructions.push(instructions[j].clone());
             }
         }
         
+        // Add successors
+        block.successors = successors.clone();
+        
         blocks.push(block);
     }
     
-    // Connect blocks (add successors and predecessors)
-    // First, collect all the connections we need to make
-    let mut connections = Vec::new();
-
-    for i in 0..blocks.len() {
-        let block = &blocks[i];
-        
-        if block.instructions.is_empty() {
-            continue;
-        }
-        
-        let last_insn = &block.instructions[block.instructions.len() - 1];
-        
-        if last_insn.is_branch() {
-            // Add branch target as successor
-            if let Some(target) = last_insn.branch_target() {
-                // Find block containing this target
-                if let Some(target_block) = blocks.iter().position(|b| b.start <= target && target <= b.end) {
-                    connections.push((i, target_block));
-                }
-            }
-            
-            // For conditional branches, the next block is also a successor
-            if last_insn.is_conditional_branch() && i + 1 < blocks.len() {
-                connections.push((i, i + 1));
-            }
-        } else if !last_insn.is_return() && !last_insn.is_exit() && i + 1 < blocks.len() {
-            // If not a branch or return, the next block is a successor
-            connections.push((i, i + 1));
-        }
-    }
-
-    // Now apply all the connections
-    for (from, to) in connections {
-        blocks[from].successors.push(to);
-        blocks[to].predecessors.push(from);
-    }
-    
-    // Identify functions
-    let mut functions = Vec::new();
-    let mut visited = HashSet::new();
-    
-    // First pass: identify function entry points
-    let mut entry_points = Vec::new();
+    // Add predecessors
     for (i, block) in blocks.iter().enumerate() {
-        if block.is_function_entry() {
-            entry_points.push(i);
+        for &succ in &block.successors {
+            if succ < blocks.len() {
+                blocks[succ].predecessors.push(i);
+            }
         }
     }
     
-    // Second pass: build functions from entry points
-    for (func_id, &entry) in entry_points.iter().enumerate() {
+    // Create functions from boundaries
+    let mut functions = Vec::new();
+    for (func_id, (start, end)) in function_boundaries.iter().enumerate() {
         let mut function = Function {
             id: func_id,
-            entry_block: entry,
+            entry_block: *start,
             blocks: Vec::new(),
             name: None,
             parameters: Vec::new(),
             return_type: None,
         };
         
-        // Use BFS to find all blocks in this function
+        // Find all blocks in this function
+        let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        queue.push_back(entry);
-        visited.insert(entry);
+        queue.push_back(*start);
+        visited.insert(*start);
         
         while let Some(block_id) = queue.pop_front() {
             function.blocks.push(block_id);
             
-            // Add successors to queue
+            // Add successors to queue if they're within function bounds
             for &succ in &blocks[block_id].successors {
-                if !visited.contains(&succ) {
+                if !visited.contains(&succ) && succ <= *end {
                     visited.insert(succ);
                     queue.push_back(succ);
                 }
             }
         }
         
-        // Try to identify function name
-        if blocks[entry].instructions.len() > 0 {
-            // Look for string references near the function start
-            // This is a heuristic - function names are often referenced near the start
-            for insn in blocks[entry].instructions.iter().take(10) {
-                if insn.is_load_imm() && insn.imm > 0 {
-                    // This might be loading a string pointer
-                    // In a real implementation, we'd try to resolve this to a string
-                    function.name = Some(format!("func_{}", func_id));
-                    break;
-                }
+        // Try to identify function name using SBPF analysis
+        if let Some(block) = blocks.get(*start) {
+            if block.is_instruction_handler() {
+                function.name = Some(format!("process_instruction_{}", func_id));
+            } else {
+                function.name = Some(format!("func_{}", func_id));
             }
         }
         
-        if function.name.is_none() {
-            function.name = Some(format!("func_{}", func_id));
-        }
-        
         functions.push(function);
-    }
-    
-    // Identify instruction handlers among the functions
-    for function in &mut functions {
-        let entry_block = &blocks[function.entry_block];
-        if entry_block.is_instruction_handler() {
-            // This is likely an instruction handler
-            function.name = Some(format!("process_instruction_{}", function.id));
-        }
     }
     
     Ok((blocks, functions))
@@ -366,7 +278,6 @@ pub fn find_byte_comparisons(instructions: &[SbfInstruction]) -> Vec<(usize, u8)
     
     comparisons
 }
-
 
 /// Find functions in a control flow graph
 pub fn find_functions(blocks: &[BasicBlock]) -> Vec<Function> {

@@ -272,6 +272,8 @@ fn analyze_anchor_program(program_id: &Pubkey, program_data: &[u8]) -> Result<mo
     
     // Enhance IDL with additional Anchor-specific information
     analyzer::anchor::enhance_idl(&mut idl, program_data)?;
+
+    // program dump cmd: solana program dump TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb ./dumped.so hexdump -C ./dumped.so | head
     
     Ok(idl)
 } 
