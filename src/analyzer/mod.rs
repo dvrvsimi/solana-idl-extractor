@@ -7,17 +7,17 @@ pub mod simulation;
 
 #[cfg(test)]
 
-use log::{info, warn, debug};
 use solana_client::rpc_client::RpcClient;
 use anyhow;
-use thiserror::Error;
-
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
 use crate::errors::AnalyzerError;
 use crate::utils::get_program_elf_bytes;
+use crate::analyzer::bytecode::parser::analyze_with_sbpf;
+use solana_sbpf::insn_builder::Instruction; // use this instead for impl on l107
+use solana_client::rpc_client::RpcClient;
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -26,7 +26,7 @@ pub use self::simulation::TransactionSimulator;
 
 /// Analyzer for Solana programs
 pub struct Analyzer {
-    // Configuration options could go here
+    // Configuration options could go here, feature toggles, analysis depth, etc.
 }
 
 impl Analyzer {
@@ -58,7 +58,7 @@ impl Analyzer {
             }
         } else {
             log::warn!("Program data does not appear to be a valid ELF file");
-        }
+        } // is this validation still needed?
         
         // Analyze bytecode
         let result = bytecode::analyze(&elf_bytes, &program_id.to_string())
@@ -106,11 +106,11 @@ impl Analyzer {
         );
 
         // Use official SBPF analysis for better instruction detection
-        let instructions = analyze_with_sbpf(&bytecode_analysis.raw_data)?;
+        let instructions = analyze_with_sbpf(&bytecode_analysis.instructions)?;
         
         // Group instructions using official analysis patterns
         let mut current_instruction = None;
-        let mut instructions = Vec::new();
+        let mut instructions = Vec::new(); // use sbpf insn__builder too? (Instruction::new())
 
         for instruction in &instructions {
             if instruction.is_instruction_handler() {

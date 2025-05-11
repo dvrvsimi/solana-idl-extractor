@@ -7,6 +7,9 @@ pub mod instruction_patterns;
 pub mod memory_analysis;
 pub mod account_analysis;
 pub mod control_flow;
+pub mod error_analysis;
+pub mod dynamic_analysis;
+pub mod discriminator_detection;
 
 use solana_pubkey::Pubkey;
 
@@ -34,14 +37,14 @@ where
         if program_account_data.len() >= 40 {
             if let Ok(programdata_pubkey) = Pubkey::try_from(&program_account_data[8..40]) {
                 if let Some(programdata_data) = fetch_account_data(&programdata_pubkey) {
-                    return Some(crate::analyzer::bytecode::extract_elf_bytes(&programdata_data).to_vec());
+                    return Some(crate::analyzer::bytecode::extract_elf_bytes(&programdata_data).unwrap().to_vec());
                 }
             }
         }
         None
     } else if program_account_owner == &legacy_loader {
         // Non-upgradeable: ELF is in this account
-        Some(crate::analyzer::bytecode::extract_elf_bytes(program_account_data).to_vec())
+        Some(crate::analyzer::bytecode::extract_elf_bytes(program_account_data).unwrap().to_vec())
     } else {
         // Not a program account
         None
@@ -73,7 +76,7 @@ pub fn find_elf_start(data: &[u8]) -> Result<usize, anyhow::Error> {
     if data.len() > 8 {
         log::warn!("No ELF header found, using fallback offset of 8 bytes");
         return Ok(8);
-    }
+    } // TODO: Add more fallback options
     
     Err(anyhow::anyhow!("No ELF header found in program data"))
 }

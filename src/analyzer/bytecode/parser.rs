@@ -12,7 +12,7 @@ use solana_sbpf::{
     elf::Executable,
     program::{BuiltinProgram, FunctionRegistry, SBPFVersion},
     static_analysis::Analysis,
-    test_utils::TestContextObject,
+    vm::ContextObject,
 };
 use std::sync::Arc;
 use crate::utils::instruction_patterns::{
@@ -428,25 +428,51 @@ impl SbfInstruction {
     pub fn is_parameter_loading(&self) -> bool {
         is_parameter_loading(self)
     }
+
+    // Add this method to convert from solana_sbpf instruction
+    pub fn from_sbpf(insn: &solana_sbpf::ebpf::Insn) -> Self {
+        Self {
+            class: match insn.opc & 0x07 {
+                0 => InstructionClass::MemoryLoadOr32BitALU,
+                1 => InstructionClass::MemoryStoreOr64BitALU,
+                2 => InstructionClass::ProductQuotientRemainder,
+                3 => InstructionClass::ControlFlow,
+                _ => InstructionClass::MemoryLoadOr32BitALU, // Default
+            },
+            opcode: insn.opc,
+            dst_reg: insn.dst,
+            src_reg: insn.src,
+            offset: insn.off,
+            imm: insn.imm as i64,
+            size: match insn.opc {
+                0x61 => 4,  // ldxw
+                0x69 => 2,  // ldxh
+                0x71 => 1,  // ldxb
+                0x79 => 8,  // ldxdw
+                _ => 0
+            },
+            version: SbpfVersion::V3,
+            is_two_slot: insn.opc == 0x18, // lddw
+        }
+    }
 }
 
 /// Parse instructions using official SBPF tools
 pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<Vec<SbfInstruction>> {
-    let executable = Executable::<TestContextObject>::from_text_bytes(
-        data,
-        Arc::new(BuiltinProgram::new_mock()),
-        SBPFVersion::V3,
-        FunctionRegistry::default(),
-    ).map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to create executable: {}", e)))?;
-
-    let analysis = Analysis::from_executable(&executable)
-        .map_err(|e| ExtractorError::BytecodeAnalysis(format!("Failed to analyze executable: {}", e)))?;
-
-    // Use SBPF's analysis to group instructions into handlers
-    let handlers = group_instruction_handlers(&analysis);
+    // Parse instructions manually without using Executable
+    let mut instructions = Vec::new();
     
-    // Flatten handlers into single instruction list
-    let instructions = handlers.into_iter().flatten().collect();
+    for i in (0..data.len()).step_by(8) {
+        if i + 8 <= data.len() {
+            match SbfInstruction::parse(&data[i..i+8], base_address + i) {
+                Ok(insn) => instructions.push(insn),
+                Err(e) => {
+                    warn!("Failed to parse instruction at offset {}: {}", i, e);
+                    // Continue parsing other instructions
+                }
+            }
+        }
+    }
     
     Ok(instructions)
 }
@@ -609,7 +635,7 @@ fn detect_sbpf_version(data: &[u8]) -> ExtractorResult<SbpfVersion> {
 /// Analyze program using official SBPF tools
 pub fn analyze_with_sbpf(program_data: &[u8]) -> ExtractorResult<Vec<SbfInstruction>> {
     // Create executable using official SBPF tools
-    let executable = Executable::<TestContextObject>::from_text_bytes(
+    let executable = Executable::<SimpleContextObject>::from_text_bytes(
         program_data,
         Arc::new(BuiltinProgram::new_mock()),
         SBPFVersion::V3,
@@ -694,7 +720,7 @@ pub fn group_instruction_handlers(analysis: &Analysis) -> Vec<Vec<SbfInstruction
         }
 
         if in_handler {
-            current_handler.push(instruction);
+            current_handler.push(instruction.clone()); //TODO: is there a better way to handle borrow issue?
         }
 
         // Check for handler end using instruction patterns
@@ -713,4 +739,13 @@ pub fn group_instruction_handlers(analysis: &Analysis) -> Vec<Vec<SbfInstruction
     }
 
     handlers
+}
+
+#[derive(Debug, Default)]
+struct SimpleContextObject;
+
+impl ContextObject for SimpleContextObject {
+    fn trace(&mut self, _state: [u64; 12]) {}
+    fn consume(&mut self, _amount: u64) {}
+    fn get_remaining(&self) -> u64 { u64::MAX }
 }

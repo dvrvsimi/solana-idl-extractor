@@ -1,6 +1,7 @@
 //! Account structure metadata for Solana programs
 
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 
 /// Represents a program account structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,9 @@ pub struct Account {
     /// Usage statistics
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_stats: Option<AccountUsageStats>,
+    /// metadata
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub metadata: HashMap<String, String>,
 }
 
 /// Represents an account field
@@ -59,6 +63,7 @@ impl Account {
             related_accounts: Vec::new(),
             child_accounts: Vec::new(),
             usage_stats: None,
+            metadata: HashMap::new(),
         }
     }
     
@@ -110,6 +115,11 @@ impl Account {
             self.child_accounts.push(account_name);
         }
     }
+
+    /// Add metadata to the account
+    pub fn add_metadata(&mut self, key: String, value: String) {
+        self.metadata.insert(key, value);
+    }
     
     /// Set usage statistics
     pub fn set_usage_stats(&mut self, frequency: usize, signer_frequency: usize, writable_frequency: usize, common_position: usize) {
@@ -120,4 +130,6 @@ impl Account {
             common_position,
         });
     }
+
+    
 } 

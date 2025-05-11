@@ -21,7 +21,7 @@ pub struct StringAnalysisResult {
 }
 
 /// Analyze strings to extract meaningful names
-pub fn analyze_strings(strings: &[String]) -> Result<StringAnalysisResult> {
+pub fn analyze_strings(strings: &[String]) -> Result<StringAnalysisResult> { //TODO: what string exactly? should i just pass the .text section?
     let mut result = StringAnalysisResult {
         instruction_names: HashMap::new(),
         account_names: HashMap::new(),
@@ -526,7 +526,7 @@ pub fn improved_string_analyzer(program_data: &[u8]) -> Result<StringAnalysisRes
     let instructions = parse_instructions(&text_section.data, text_section.address as usize)?;
     
     // Build CFG
-    let (blocks, functions) = cfg::build_cfg(&instructions)?;
+    let (blocks, functions) = cfg::build_cfg(&instructions)?; // this too
     
     // Perform multiple types of string analysis
     let basic_scores = enhanced_string_analysis(&string_constants)?;

@@ -98,89 +98,199 @@ pub struct Function {
     pub return_type: Option<String>,
 }
 
-/// Build a control flow graph from instructions using SBPF analysis
-pub fn build_cfg(instructions: &[SbfInstruction], analysis: &Analysis) -> Result<(Vec<BasicBlock>, Vec<Function>)> {
-    // Use SBPF's analysis to find function boundaries
-    let function_boundaries = find_function_boundaries(analysis);
+/// Create functions from basic blocks and function boundaries
+fn create_functions(blocks: &[BasicBlock], function_boundaries: &[(usize, usize)]) -> Vec<Function> {
+    let mut functions = Vec::new();
     
-    // Use SBPF's analysis to build CFG
-    let cfg = analyze_control_flow(analysis);
-    
-    // Create basic blocks from CFG
-    let mut blocks = Vec::new();
-    for (i, (start, successors)) in cfg.iter().enumerate() {
-        let mut block = BasicBlock::new(i, *start);
+    for (i, &(start, end)) in function_boundaries.iter().enumerate() {
+        // Find blocks that belong to this function
+        let function_blocks: Vec<usize> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.start >= start && block.end <= end)
+            .map(|(idx, _)| idx)
+            .collect();
         
-        // Add instructions to block
-        let end = if i + 1 < cfg.len() {
-            cfg[i + 1].0 - 1
-        } else {
-            instructions.len() - 1
-        };
-        
-        block.end = end;
-        for j in *start..=end {
-            if j < instructions.len() {
-                block.instructions.push(instructions[j].clone());
-            }
+        if !function_blocks.is_empty() {
+            functions.push(Function {
+                id: i,
+                entry_block: function_blocks[0],
+                blocks: function_blocks,
+                name: Some(format!("func_{:x}", start)),
+                parameters: Vec::new(),
+                return_type: None,
+            });
         }
+    }
+    
+    functions
+}
+
+/// Enhanced block detection using SBPF analysis
+fn detect_blocks(analysis: &Analysis, instructions: &[SbfInstruction]) -> Vec<BasicBlock> {
+    let mut blocks = Vec::new();
+    let mut current_block = Vec::new();
+    let mut current_address = 0;
+    let mut block_id = 0;
+
+    for (pc, insn) in analysis.instructions.iter().enumerate() {
+        let instruction = SbfInstruction::from_sbpf(insn);
         
-        // Add successors
-        block.successors = successors.clone();
-        
+        // Block boundaries are:
+        // 1. Branch targets
+        // 2. Instructions after branches/calls
+        // 3. Function entry points
+        // 4. Return/exit points
+        let is_block_boundary = is_block_boundary(&instruction, pc, analysis);
+
+        if is_block_boundary {
+            // Create new block from current instructions
+            if !current_block.is_empty() {
+                let mut block = BasicBlock::new(block_id, current_address);
+                block.end = pc - 1;
+                block.instructions = current_block.clone();
+                blocks.push(block);
+                block_id += 1;
+                current_block.clear();
+            }
+            current_address = pc;
+        }
+
+        current_block.push(instruction);
+    }
+
+    // Add final block if any
+    if !current_block.is_empty() {
+        let mut block = BasicBlock::new(block_id, current_address);
+        block.end = instructions.len() - 1;
+        block.instructions = current_block;
         blocks.push(block);
     }
-    
-    // Add predecessors
-    for (i, block) in blocks.iter().enumerate() {
-        for &succ in &block.successors {
-            if succ < blocks.len() {
-                blocks[succ].predecessors.push(i);
+
+    // Connect blocks using SBPF analysis
+    connect_blocks(&mut blocks, analysis);
+
+    blocks
+}
+
+/// Check if instruction is a block boundary
+fn is_block_boundary(instruction: &SbfInstruction, pc: usize, analysis: &Analysis) -> bool {
+    // 1. Check if this is a branch target
+    if is_branch_target(pc, analysis) {
+        return true;
+    }
+
+    // 2. Check if this is after a branch/call
+    if pc > 0 {
+        let prev_insn = SbfInstruction::from_sbpf(&analysis.instructions[pc - 1]);
+        if is_branch(&prev_insn) || is_call(&prev_insn) {
+            return true;
+        }
+    }
+
+    // 3. Check if this is a function entry point
+    if is_function_entry(instruction, pc, analysis) {
+        return true;
+    }
+
+    // 4. Check if this is a return/exit point
+    if is_exit(instruction) {
+        return true;
+    }
+
+    false
+}
+
+/// Check if instruction is a branch target
+fn is_branch_target(pc: usize, analysis: &Analysis) -> bool {
+    // Look for branches targeting this instruction
+    for i in 0..pc {
+        let insn = SbfInstruction::from_sbpf(&analysis.instructions[i]);
+        if let Some(target) = branch_target(&insn, i) {
+            if target == pc {
+                return true;
             }
         }
     }
+    false
+}
+
+/// Check if instruction is a function entry point
+fn is_function_entry(instruction: &SbfInstruction, pc: usize, analysis: &Analysis) -> bool {
+    // Function entry points typically:
+    // 1. Start with stack setup
+    // 2. Have no incoming branches
+    // 3. Have specific register patterns
     
-    // Create functions from boundaries
-    let mut functions = Vec::new();
-    for (func_id, (start, end)) in function_boundaries.iter().enumerate() {
-        let mut function = Function {
-            id: func_id,
-            entry_block: *start,
-            blocks: Vec::new(),
-            name: None,
-            parameters: Vec::new(),
-            return_type: None,
-        };
+    // Check for stack setup pattern
+    let has_stack_setup = instruction.is_mov_reg() && 
+                         instruction.dst_reg == 11 && 
+                         instruction.src_reg == 1;
+
+    // Check for no incoming branches
+    let no_incoming = !is_branch_target(pc, analysis);
+
+    // Check for register setup pattern
+    let has_register_setup = instruction.is_mov_reg() && 
+                            (instruction.dst_reg == 1 || instruction.dst_reg == 10);
+
+    has_stack_setup || (no_incoming && has_register_setup)
+}
+
+/// Connect blocks using SBPF analysis
+fn connect_blocks(blocks: &mut Vec<BasicBlock>, analysis: &Analysis) {
+    // First, collect all the connections we need to make
+    let mut connections = Vec::new();
+    
+    for i in 0..blocks.len() {
+        let block = &blocks[i];
         
-        // Find all blocks in this function
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back(*start);
-        visited.insert(*start);
-        
-        while let Some(block_id) = queue.pop_front() {
-            function.blocks.push(block_id);
-            
-            // Add successors to queue if they're within function bounds
-            for &succ in &blocks[block_id].successors {
-                if !visited.contains(&succ) && succ <= *end {
-                    visited.insert(succ);
-                    queue.push_back(succ);
+        // Get the last instruction in the block
+        if let Some(last_insn) = block.instructions.last() {
+            // Check if it's a branch instruction
+            if last_insn.is_branch() {
+                // Calculate target block index
+                let target_offset = last_insn.offset as i16;
+                let target_pc = (block.end as i32 + target_offset as i32) as usize;
+                
+                // Find the target block
+                if let Some(target_block) = blocks.iter().position(|b| b.start <= target_pc && target_pc <= b.end) {
+                    // Store the connection to make later
+                    connections.push((i, target_block));
                 }
             }
         }
-        
-        // Try to identify function name using SBPF analysis
-        if let Some(block) = blocks.get(*start) {
-            if block.is_instruction_handler() {
-                function.name = Some(format!("process_instruction_{}", func_id));
-            } else {
-                function.name = Some(format!("func_{}", func_id));
-            }
-        }
-        
-        functions.push(function);
     }
+    
+    // Now apply all the connections
+    for (source, target) in connections {
+        if source < target {
+            // Add connection from source to target
+            blocks[source].successors.push(target);
+            blocks[target].predecessors.push(source);
+        } else {
+            // Add connection from source to target
+            blocks[source].successors.push(target);
+            blocks[target].predecessors.push(source);
+        }
+    }
+}
+
+/// Find block containing a specific instruction
+fn find_block_containing(pc: usize, blocks: &[BasicBlock]) -> Option<usize> {
+    blocks.iter().position(|b| b.start <= pc && pc <= b.end)
+}
+
+/// Build a control flow graph from instructions using SBPF analysis
+pub fn build_cfg(instructions: &[SbfInstruction], analysis: &Analysis) -> Result<(Vec<BasicBlock>, Vec<Function>)> {
+    // Use enhanced block detection
+    let blocks = detect_blocks(analysis, instructions);
+    
+    // Use SBPF's analysis to find function boundaries
+    let function_boundaries = find_function_boundaries(analysis);
+    
+    // Create functions from boundaries
+    let functions = create_functions(&blocks, &function_boundaries);
     
     Ok((blocks, functions))
 }

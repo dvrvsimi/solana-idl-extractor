@@ -67,7 +67,7 @@ impl ElfAnalyzer {
     
     /// Create a new ELF analyzer from bytes
     // Update the from_bytes method to use unsafe transmute for the lifetime
-pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
     let elf_ref = Elf::parse(&data)
         .context("Failed to parse ELF file")?;
     

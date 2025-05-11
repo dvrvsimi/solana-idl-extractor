@@ -51,9 +51,9 @@ pub struct AccountMeta {
 
 impl Instruction {
     /// Create a new instruction
-    pub fn new(name: String, index: u8) -> Self {
+    pub fn new <S:Into<String>>(name: S, index: u8) -> Self {
         Self {
-            name,
+            name: name.into(), // debug
             index,
             discriminator: None,
             accounts: Vec::new(),

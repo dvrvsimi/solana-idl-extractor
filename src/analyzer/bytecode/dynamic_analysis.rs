@@ -1,6 +1,21 @@
-use crate::models::instruction::Argument;
-use goblin::elf::Elf;
+//! Dynamic analysis for Solana programs
 
+use anyhow::Result;
+use crate::models::instruction::Argument;
+use crate::utils::dynamic_analysis::{
+    analyze_dynamic,
+    DynamicAnalysisResult,
+    InstructionTrace,
+    AccountAccess,
+    MemoryAccess,
+};
+use solana_sbpf::{
+    static_analysis::Analysis,
+    program::SBPFVersion,
+    vm::Config,
+};
+use crate::analyzer::bytecode::parser::SbfInstruction;
+use goblin::elf::Elf;
 
 /// Extract arguments from a program by analyzing its bytecode patterns
 pub fn extract_args(program_data: &[u8], entrypoint: usize) -> Vec<Argument> {
@@ -158,4 +173,65 @@ fn infer_args_heuristically(_text_data: &[u8], _entrypoint: usize) -> Vec<Argume
             docs: Some("The accounts required by this instruction".to_string()),
         },
     ]
+}
+
+/// Analyze program execution dynamically
+pub fn analyze_program(
+    instructions: &[SbfInstruction],
+    analysis: &Analysis,
+    version: SBPFVersion,
+    config: &Config,
+) -> Result<DynamicAnalysisResult> {
+    // Use the utility function for dynamic analysis
+    analyze_dynamic(instructions, analysis, version, config)
+}
+
+/// Get instruction trace for a specific instruction
+pub fn get_instruction_trace(
+    instructions: &[SbfInstruction],
+    analysis: &Analysis,
+    index: usize,
+) -> Option<InstructionTrace> {
+    // Create a dynamic analysis result
+    let result = analyze_dynamic(
+        instructions,
+        analysis,
+        SBPFVersion::V3,
+        &Config::default(),
+    ).ok()?;
+    
+    // Get the trace for the specified instruction
+    result.instruction_trace.get(index).cloned()
+}
+
+/// Get account access patterns
+pub fn get_account_accesses(
+    instructions: &[SbfInstruction],
+    analysis: &Analysis,
+) -> Result<Vec<AccountAccess>> {
+    // Create a dynamic analysis result
+    let result = analyze_dynamic(
+        instructions,
+        analysis,
+        SBPFVersion::V3,
+        &Config::default(),
+    )?;
+    
+    Ok(result.account_accesses)
+}
+
+/// Get memory access patterns
+pub fn get_memory_accesses(
+    instructions: &[SbfInstruction],
+    analysis: &Analysis,
+) -> Result<Vec<MemoryAccess>> {
+    // Create a dynamic analysis result
+    let result = analyze_dynamic(
+        instructions,
+        analysis,
+        SBPFVersion::V3,
+        &Config::default(),
+    )?;
+    
+    Ok(result.memory_accesses)
 } 

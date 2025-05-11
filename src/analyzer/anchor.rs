@@ -140,12 +140,11 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
     let empty_discriminators: Vec<crate::analyzer::bytecode::discriminator_detection::AnchorDiscriminator> = Vec::new();
     
     // Extract account structures
-    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures(
+    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures( // TODO: simplify this, use import
         program_data,
-        &empty_instructions,
-        &empty_discriminators
+        &analysis, //TODO: is this correct??
     )
-    .context("Failed to extract account structures")?;
+    .context("Failed to extract account structures")?; // TODO: Box<dyn Error> issues again
     
     // Extract custom error codes
     let error_codes = extract_custom_error_codes(program_data)
@@ -187,7 +186,7 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
 
 /// Extract Anchor version from program data
 fn extract_anchor_version(program_data: &[u8]) -> Option<String> {
-    // Look for version pattern in rodata section
+    // Look for version pattern in .rodata section
     extract_after_pattern(program_data, ANCHOR_VERSION_PREFIX, &[0, b'\n', b' '])
 }
 
