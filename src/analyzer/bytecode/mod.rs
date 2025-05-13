@@ -24,15 +24,19 @@ pub use account_analyzer::extract_account_structures;
 pub use cfg::{BasicBlock, Function, build_cfg};
 pub use discriminator_detection::{AnchorDiscriminator, DiscriminatorKind, extract_discriminators};
 pub use disassembler::{disassemble_program, DisassembledProgram};
-pub use string_analyzer::analyze_strings;
+use parser::SimpleContextObject;
+use solana_sbpf::program::BuiltinProgram;
+pub use string_analyzer::{analyze_strings, extract_strings_from_program};
 
 use anyhow::{Result, Context, anyhow};
 use log::{debug, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use solana_sbpf::{
     static_analysis::Analysis,
     program::SBPFVersion,
     vm::Config,
+    elf::Executable,
 };
 
 use crate::models::instruction::Instruction;
@@ -41,6 +45,8 @@ use crate::analyzer::anchor::is_anchor_program;
 use crate::utils::find_elf_start;
 use crate::utils::dynamic_analysis::{analyze_dynamic, DynamicAnalysisResult, get_account_access_patterns, get_instruction_frequency, AccessType};
 use crate::utils::error_analysis::{extract_error_codes, ErrorAnalysis};
+use goblin::elf::Elf;
+
 
 /// Results of bytecode analysis 
 ///
@@ -113,7 +119,15 @@ pub fn analyze(
     
     // Create SBPF analysis
     let elf_bytes = crate::analyzer::bytecode::extract_elf_bytes(program_data)?;
-    let analysis = Analysis::from_executable(&elf_bytes)?; // TODO: is this mine or sbpf's?, also see how to replace with anyhow
+    
+    // Create an Executable instance first
+    let loader = Arc::new(BuiltinProgram::<SimpleContextObject>::new_mock());
+    let executable = Executable::from_elf(elf_bytes, loader.clone())
+        .map_err(|e| anyhow!("Failed to create executable: {}", e))?;
+    
+    // Now create the analysis from the executable
+    let analysis = Analysis::from_executable(&executable)
+        .map_err(|e| anyhow!("Failed to analyze executable: {}", e))?;
     
     // Check if this is an Anchor program
     let is_anchor = is_anchor_program(program_data);
@@ -129,7 +143,8 @@ pub fn analyze(
         let account_patterns = get_account_access_patterns(&dynamic_result);
         extract_account_structures_with_patterns(program_data, &analysis, &account_patterns)?
     } else {
-        extract_account_structures(program_data, &analysis)? // TODO: replace with anyhow, Box seems to lack some traits?
+        extract_account_structures(program_data, &analysis)
+        .map_err(|e| anyhow!("Failed to extract accounts: {}", e))? 
     };
     
     // Extract error codes
@@ -142,7 +157,8 @@ pub fn analyze(
     let discriminators = extract_discriminators(program_data)?;
     
     // Analyze strings
-    let string_analysis = analyze_strings(program_data)?; // TODO: this expects String from initial definition, which one is correct?
+    let extracted_strings = extract_strings_from_program(program_data)?;
+    let string_analysis = analyze_strings(&extracted_strings)?;
     let strings: Vec<String> = string_analysis.instruction_names.keys().cloned().collect();
     
     // Perform dynamic analysis
@@ -182,7 +198,8 @@ fn extract_account_structures_with_patterns(
     analysis: &Analysis,
     account_patterns: &HashMap<usize, Vec<AccessType>>,
 ) -> Result<Vec<Account>> {
-    let mut accounts = extract_account_structures(program_data, analysis)?; //TODO: this shit again
+    let mut accounts = extract_account_structures(program_data, analysis)
+        .map_err(|e| anyhow!("Failed to extract accounts: {}", e))?;
     
     // Enhance accounts with access patterns
     for (idx, patterns) in account_patterns {
@@ -202,12 +219,40 @@ fn extract_account_structures_with_patterns(
 
 /// Extract program name from bytecode
 pub fn extract_program_name(program_data: &[u8]) -> Result<String> {
-    // Try to find program name in strings
-    let string_analysis = analyze_strings(program_data)?; // TODO
-    for name in string_analysis.instruction_names.keys() {
-        if name.len() > 3 && name.len() < 50 && 
-           name.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-') {
-            return Ok(name.clone());
+    // 1. Try to parse ELF and check e_ident for ASCII name
+    if let Ok(elf) = Elf::parse(program_data) {
+        // e_ident is the first 16 bytes of the ELF header
+        let e_ident = &program_data[0..16];
+        if let Ok(ascii) = std::str::from_utf8(e_ident) {
+            // Look for a printable substring
+            let ascii_name = ascii.trim_matches(char::from(0)).trim();
+            if ascii_name.len() > 3 && ascii_name.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                return Ok(ascii_name.to_string());
+            }
+        }
+        // 2. Check symbol table for global symbols (STT_OBJECT or STT_FUNC)
+        for sym in &elf.syms {
+            if let Some (name) = elf.strtab.get_at(sym.st_name) {
+                if name.len() > 3 && name.len() < 32 && name.chars().all(|c| c.is_ascii_graphic() || c == '_') {
+                    // Prefer symbols that look like program names
+                    // (sym.is_function() || sym.is_object()) is not available in goblin, so just check name
+                    return Ok(name.to_string());
+                }
+            }
+        }
+        // 3. Try the first string in the string table
+        if let Ok(strs) = elf.strtab.to_vec() {
+            if let Some(first_str) = strs.iter().find(|s| s.len() > 3 && s.len() < 32) {
+                return Ok(first_str.to_string());
+            }
+        }
+    }
+    // 4. Fallback: Use string analysis with confidence
+    let extracted_strings = crate::analyzer::bytecode::string_analyzer::extract_strings_from_program(program_data)?;
+    let string_analysis = crate::analyzer::bytecode::string_analyzer::analyze_strings(&extracted_strings)?;
+    if let Some((best_name, _)) = string_analysis.instruction_names.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)) {
+        if best_name.len() > 3 && best_name.len() < 32 {
+            return Ok(best_name.clone());
         }
     }
     
@@ -217,7 +262,7 @@ pub fn extract_program_name(program_data: &[u8]) -> Result<String> {
 
 /// Dump text section for debugging
 pub fn dump_text_section(program_data: &[u8]) -> Result<()> {
-    let elf_analyzer = ElfAnalyzer::from_bytes(extract_elf_bytes(program_data)?)?; // TODO: convert to vec
+    let elf_analyzer = ElfAnalyzer::from_bytes(extract_elf_bytes(program_data)?.to_vec())?;
     if let Ok(Some(text_section)) = elf_analyzer.get_text_section() {
         info!("Text section size: {} bytes", text_section.data.len());
         info!("Text section address: 0x{:x}", text_section.address);

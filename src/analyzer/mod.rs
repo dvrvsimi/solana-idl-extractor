@@ -13,11 +13,8 @@ use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
-use crate::errors::AnalyzerError;
-use crate::utils::get_program_elf_bytes;
 use crate::analyzer::bytecode::parser::analyze_with_sbpf;
 use solana_sbpf::insn_builder::Instruction; // use this instead for impl on l107
-use solana_client::rpc_client::RpcClient;
 
 // Re-export common types
 pub use self::bytecode::BytecodeAnalysis;
@@ -99,40 +96,36 @@ impl Analyzer {
     }
     
     /// Build IDL from analysis results
-    pub async fn build_idl(&self, program_id: &solana_pubkey::Pubkey, bytecode_analysis: BytecodeAnalysis, pattern_analysis: PatternAnalysis) -> ExtractorResult<IDL> {
+    pub async fn build_idl(&self, program_id: &solana_pubkey::Pubkey, program_data: &[u8], bytecode_analysis: BytecodeAnalysis, pattern_analysis: PatternAnalysis) -> ExtractorResult<IDL> {
         let mut idl = IDL::new(
             format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
             program_id.to_string()
         );
 
         // Use official SBPF analysis for better instruction detection
-        let instructions = analyze_with_sbpf(&bytecode_analysis.instructions)?;
-        
-        // Group instructions using official analysis patterns
-        let mut current_instruction = None;
-        let mut instructions = Vec::new(); // use sbpf insn__builder too? (Instruction::new())
+        let sbpf_instructions = crate::analyzer::bytecode::parser::analyze_with_sbpf(program_data)?;
 
-        for instruction in &instructions {
+        // Group instructions using official analysis patterns
+        let mut current_instruction: Option<crate::models::instruction::Instruction> = None;
+        let mut idl_instructions: Vec<crate::models::instruction::Instruction> = Vec::new();
+
+        for instruction in &sbpf_instructions {
             if instruction.is_instruction_handler() {
                 // Start new instruction group
                 if let Some(complete_instruction) = current_instruction.take() {
-                    instructions.push(complete_instruction);
+                    idl_instructions.push(complete_instruction);
                 }
-                
                 // Use discriminator value for instruction name
                 let name = if instruction.is_discriminator_check() {
                     format!("instruction_{}", instruction.imm)
                 } else {
-                    format!("instruction_{}", instructions.len())
+                    format!("instruction_{}", idl_instructions.len())
                 };
-                
-                current_instruction = Some(Instruction::new(name, instructions.len() as u8));
+                current_instruction = Some(crate::models::instruction::Instruction::new(name, idl_instructions.len() as u8));
             }
-
             // Add accounts and parameters based on instruction patterns
             if let Some(ref mut current) = current_instruction {
                 if instruction.is_account_validation() {
-                    // Add account to current instruction
                     current.add_account(
                         format!("account_{}", current.accounts.len()),
                         true,  // Is signer - can be refined based on checks
@@ -140,9 +133,7 @@ impl Analyzer {
                         false  // Not optional by default
                     );
                 }
-
                 if instruction.is_parameter_loading() {
-                    // Add parameter based on load size
                     let param_type = match instruction.size {
                         1 => "u8",
                         2 => "u16",
@@ -157,18 +148,14 @@ impl Analyzer {
                 }
             }
         }
-        
         // Add final instruction if any
         if let Some(instruction) = current_instruction {
-            instructions.push(instruction);
+            idl_instructions.push(instruction);
         }
-
         // Add processed instructions to IDL
-        for instruction in instructions {
+        for instruction in idl_instructions {
             idl.add_instruction(instruction);
         }
-
-        // Rest of the existing build_idl implementation...
         Ok(idl)
     }
     
@@ -181,7 +168,7 @@ impl Analyzer {
         simulation_results: Vec<simulation::SimulationResult>
     ) -> ExtractorResult<IDL> {
         // First build the basic IDL
-        let mut idl = self.build_idl(program_id, bytecode_analysis.clone(), pattern_analysis)
+        let mut idl = self.build_idl(program_id, &[], bytecode_analysis.clone(), pattern_analysis)
             .await?;
         
         // Enhance IDL with simulation results

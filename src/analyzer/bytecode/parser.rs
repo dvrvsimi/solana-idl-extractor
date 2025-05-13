@@ -135,7 +135,7 @@ impl SbfInstruction {
             (InstructionClass::MemoryStoreOr64BitALU, _) => 8,
             _ => 0,
         };
-
+        
         Ok(Self {
             class,
             opcode,
@@ -741,8 +741,7 @@ pub fn group_instruction_handlers(analysis: &Analysis) -> Vec<Vec<SbfInstruction
     handlers
 }
 
-#[derive(Debug, Default)]
-struct SimpleContextObject;
+pub struct SimpleContextObject;
 
 impl ContextObject for SimpleContextObject {
     fn trace(&mut self, _state: [u64; 12]) {}

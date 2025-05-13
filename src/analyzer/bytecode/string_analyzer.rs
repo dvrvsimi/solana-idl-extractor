@@ -526,7 +526,7 @@ pub fn improved_string_analyzer(program_data: &[u8]) -> Result<StringAnalysisRes
     let instructions = parse_instructions(&text_section.data, text_section.address as usize)?;
     
     // Build CFG
-    let (blocks, functions) = cfg::build_cfg(&instructions)?; // this too
+    let (blocks, functions) = cfg::build_cfg_from_instructions(&instructions)?;
     
     // Perform multiple types of string analysis
     let basic_scores = enhanced_string_analysis(&string_constants)?;
@@ -581,4 +581,31 @@ pub fn improved_string_analyzer(program_data: &[u8]) -> Result<StringAnalysisRes
     };
     
     Ok(result)
+}
+
+/// Extract all strings from the program's ELF .rodata section
+pub fn extract_strings_from_program(program_data: &[u8]) -> Result<Vec<String>> {
+    let elf_analyzer = ElfAnalyzer::from_bytes(program_data.to_vec())?;
+    let mut strings = Vec::new();
+    // Get the rodata section which typically contains string literals
+    if let Ok(Some(rodata)) = elf_analyzer.get_rodata_section() {
+        let mut i = 0;
+        while i < rodata.data.len() {
+            // Look for null-terminated strings
+            let start = i;
+            while i < rodata.data.len() && rodata.data[i] != 0 {
+                i += 1;
+            }
+            if i > start {
+                // Found a potential string
+                if let Ok(s) = std::str::from_utf8(&rodata.data[start..i]) {
+                    if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()) {
+                        strings.push(s.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    Ok(strings)
 } 

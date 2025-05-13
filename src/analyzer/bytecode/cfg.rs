@@ -429,3 +429,99 @@ pub fn find_functions(blocks: &[BasicBlock]) -> Vec<Function> {
     
     functions
 }
+
+/// Build a basic control flow graph from instructions only (no SBPF Analysis)
+pub fn build_cfg_from_instructions(instructions: &[SbfInstruction]) -> Result<(Vec<BasicBlock>, Vec<Function>)> { //TODO: this needs to be robust, oly ix won't do
+    let mut blocks = Vec::new();
+    let mut block_starts = std::collections::HashSet::new();
+    let mut jump_targets = std::collections::HashSet::new();
+    let mut block_id = 0;
+
+    // First pass: find all jump targets
+    for insn in instructions {
+        if insn.is_branch() {
+            if let Some(target) = insn.branch_target() {
+                jump_targets.insert(target);
+            }
+        }
+    }
+
+    // Always start with the first instruction
+    block_starts.insert(0);
+    // Add jump targets as block starts
+    block_starts.extend(jump_targets.iter().cloned());
+    // Add instruction after every branch/call/return as block start
+    for (i, insn) in instructions.iter().enumerate() {
+        if insn.is_branch() || insn.is_return() {
+            if i + 1 < instructions.len() {
+                block_starts.insert(i + 1);
+            }
+        }
+    }
+
+    // Sort block starts
+    let mut block_starts: Vec<usize> = block_starts.into_iter().collect();
+    block_starts.sort_unstable();
+
+    // Second pass: create blocks
+    for (idx, &start) in block_starts.iter().enumerate() {
+        let end = if idx + 1 < block_starts.len() {
+            block_starts[idx + 1] - 1
+        } else {
+            instructions.len() - 1
+        };
+        let mut block = BasicBlock::new(block_id, start);
+        block.end = end;
+        block.instructions = instructions[start..=end].to_vec();
+        blocks.push(block);
+        block_id += 1;
+    }
+
+    // Third pass: connect blocks
+    for i in 0..blocks.len() {
+        // First collect the connections to make
+        let mut connections = Vec::new();
+        
+        // Use a scope to limit the borrow of blocks
+        {
+            let block = &blocks[i];
+            if let Some(last_insn) = block.instructions.last() {
+                if last_insn.is_branch() {
+                    if let Some(target) = last_insn.branch_target() {
+                        let target_idx_opt = blocks.iter().position(|b| b.start <= target && target <= b.end);
+                        if let Some(target_idx) = target_idx_opt {
+                            connections.push((i, target_idx));
+                        }
+                    }
+                }
+                // Fall-through successor
+                if !last_insn.is_return() && i + 1 < blocks.len() {
+                    connections.push((i, i + 1));
+                }
+            }
+        }
+        
+        // Now apply the connections without conflicting borrows
+        for (from, to) in connections {
+            blocks[from].successors.push(to);
+            blocks[to].predecessors.push(from);
+        }
+    }
+
+    // Heuristic: treat each block with no predecessors as a function entry
+    let mut functions = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if block.predecessors.is_empty() {
+            functions.push(Function {
+                id: functions.len(),
+                entry_block: i,
+                blocks: vec![i],
+                name: Some(format!("func_{:x}", block.start)),
+                parameters: Vec::new(),
+                return_type: None,
+            });
+        }
+    }
+
+    Ok((blocks, functions))
+}

@@ -209,7 +209,7 @@ pub fn get_account_accesses(
     instructions: &[SbfInstruction],
     analysis: &Analysis,
 ) -> Result<Vec<AccountAccess>> {
-    // Create a dynamic analysis result
+    // Create a dynamic (more like static but okay) analysis result
     let result = analyze_dynamic(
         instructions,
         analysis,

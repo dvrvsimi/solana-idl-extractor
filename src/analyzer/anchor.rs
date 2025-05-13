@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow, Context};
 use log::{info, debug, warn};
 use solana_pubkey::Pubkey;
+use crate::analyzer::bytecode::parser::SimpleContextObject;
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::models::idl::IDL;
@@ -10,6 +11,8 @@ use crate::constants::anchor::{INSTRUCTION_PREFIX, ANCHOR_VERSION_PREFIX, ANCHOR
 use crate::utils::pattern::{find_pattern, extract_after_pattern};
 use crate::utils::hash::generate_anchor_discriminator;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use solana_sbpf::{elf::Executable, program::BuiltinProgram, static_analysis::Analysis};
 
 /// Anchor program analysis results
 pub struct AnchorAnalysis {
@@ -135,16 +138,24 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
         instructions.push(instruction);
     }
     
-    // Extract account structures - create empty instructions array for now
-    let empty_instructions: Vec<crate::analyzer::bytecode::parser::SbfInstruction> = Vec::new();
-    let empty_discriminators: Vec<crate::analyzer::bytecode::discriminator_detection::AnchorDiscriminator> = Vec::new();
+    // --- Create SBPF analysis (mirroring bytecode/mod.rs) ---
+    let elf_bytes = crate::analyzer::bytecode::extract_elf_bytes(program_data)?;
+
+    let loader = Arc::new(BuiltinProgram::new_mock());
+
+    let executable = Executable::<SimpleContextObject>::from_elf(elf_bytes, loader.clone())
+        .map_err(|e| anyhow!("Failed to create executable: {}", e))?;
+
+    let analysis = Analysis::from_executable(&executable)
+        .map_err(|e| anyhow!("Failed to analyze executable: {}", e))?;
+    // --------------------------------------------------------
     
     // Extract account structures
-    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures( // TODO: simplify this, use import
+    let accounts = crate::analyzer::bytecode::account_analyzer::extract_account_structures(
         program_data,
-        &analysis, //TODO: is this correct??
+        &analysis,
     )
-    .context("Failed to extract account structures")?; // TODO: Box<dyn Error> issues again
+    .map_err(|e| anyhow!("Failed to extract account structures: {}", e))?;
     
     // Extract custom error codes
     let error_codes = extract_custom_error_codes(program_data)
