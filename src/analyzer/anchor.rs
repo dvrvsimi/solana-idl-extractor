@@ -1,18 +1,20 @@
 //! Anchor program analysis for Solana programs
 
 use anyhow::{Result, anyhow, Context};
-use log::{info, debug, warn};
+use log::{info, debug};
 use solana_pubkey::Pubkey;
 use crate::analyzer::bytecode::parser::SimpleContextObject;
 use crate::models::instruction::Instruction;
 use crate::models::account::Account;
 use crate::models::idl::IDL;
-use crate::constants::anchor::{INSTRUCTION_PREFIX, ANCHOR_VERSION_PREFIX, ANCHOR_PATTERNS};
-use crate::utils::pattern::{find_pattern, extract_after_pattern};
+use crate::constants::anchor::{ANCHOR_VERSION_PREFIX};
+use crate::utils::pattern::find_pattern;
 use crate::utils::hash::generate_anchor_discriminator;
-use std::collections::{HashMap, HashSet};
+use crate::utils::anchor::{extract_anchor_version, find_string, extract_instruction_handlers};
+use std::collections::{HashMap, BTreeMap};
 use std::sync::Arc;
 use solana_sbpf::{elf::Executable, program::BuiltinProgram, static_analysis::Analysis};
+use crate::analyzer::bytecode::extract_program_name;
 
 /// Anchor program analysis results
 pub struct AnchorAnalysis {
@@ -24,12 +26,20 @@ pub struct AnchorAnalysis {
     pub error_codes: HashMap<u32, String>,
     /// Is this an Anchor program?
     pub is_anchor: bool,
+    /// Anchor version if detected
+    pub anchor_version: Option<String>,
+    /// Metadata for extensibility
+    pub metadata: BTreeMap<String, String>,
+    /// Raw handler names found in binary
+    pub handler_names: Vec<String>,
+    /// Diagnostics or warnings
+    pub diagnostics: Vec<String>,
 }
 
 /// Check if a program is an Anchor program by examining various indicators
 pub fn is_anchor_program(program_data: &[u8]) -> bool {
     // Method 1: Check for Anchor's characteristic string patterns
-    if let Some(version) = extract_anchor_version(program_data) {
+    if let Some(version) = extract_anchor_version(program_data, ANCHOR_VERSION_PREFIX) {
         info!("Detected Anchor program with version: {}", version);
         return true;
     }
@@ -80,32 +90,6 @@ pub fn is_anchor_program(program_data: &[u8]) -> bool {
     }
     
     false
-}
-
-/// Extract instruction handlers from an Anchor program
-pub fn extract_instruction_handlers(program_data: &[u8]) -> Result<Vec<String>> {
-    let mut handlers = Vec::new();
-    
-    // Find all occurrences of "Instruction: X" in the program data
-    for (i, window) in program_data.windows(INSTRUCTION_PREFIX.len()).enumerate() {
-        if window == INSTRUCTION_PREFIX {
-            // Extract the instruction name
-            let start = i + INSTRUCTION_PREFIX.len();
-            let mut end = start;
-            while end < program_data.len() && program_data[end] != 0 && program_data[end] != b'\n' {
-                end += 1;
-            }
-            
-            if let Ok(name) = std::str::from_utf8(&program_data[start..end]) {
-                if !name.is_empty() && !handlers.contains(&name.to_string()) {
-                    handlers.push(name.to_string());
-                }
-            }
-        }
-    }
-    
-    debug!("Found {} instruction handlers", handlers.len());
-    Ok(handlers)
 }
 
 /// Analyze an Anchor program
@@ -161,11 +145,28 @@ pub fn analyze(program_id: &Pubkey, program_data: &[u8]) -> Result<AnchorAnalysi
     let error_codes = extract_custom_error_codes(program_data)
         .context("Failed to extract error codes")?;
     
+    // Anchor version
+    let anchor_version = extract_anchor_version(program_data, ANCHOR_VERSION_PREFIX);
+
+    // Metadata
+    let mut metadata = BTreeMap::new();
+    if let Some(ref v) = anchor_version {
+        metadata.insert("anchor_version".to_string(), v.clone());
+    }
+    metadata.insert("program_id".to_string(), program_id.to_string());
+
+    // Diagnostics (TODO: add proper diagnostics)
+    let diagnostics = Vec::new();
+
     Ok(AnchorAnalysis {
         instructions,
         accounts,
         error_codes,
         is_anchor: true,
+        anchor_version,
+        metadata,
+        handler_names,
+        diagnostics,
     })
 }
 
@@ -179,9 +180,15 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
     idl.metadata.origin = "anchor".to_string();
     
     // Try to extract Anchor version
-    if let Some(version) = extract_anchor_version(program_data) {
+    if let Some(version) = extract_anchor_version(program_data, ANCHOR_VERSION_PREFIX) {
         idl.metadata.framework_version = Some(version);
     }
+    
+    // Set metadata name and notes
+    let program_name = extract_program_name(program_data)
+        .unwrap_or_else(|_| "Unknown Program".to_string());
+    idl.metadata.metadata_name = program_name;
+    idl.metadata.notes = Some("Extracted from Anchor program".to_string());
     
     // Extract custom error codes
     let error_codes = extract_custom_error_codes(program_data)
@@ -193,12 +200,6 @@ pub fn enhance_idl(idl: &mut IDL, program_data: &[u8]) -> Result<()> {
     }
     
     Ok(())
-}
-
-/// Extract Anchor version from program data
-fn extract_anchor_version(program_data: &[u8]) -> Option<String> {
-    // Look for version pattern in .rodata section
-    extract_after_pattern(program_data, ANCHOR_VERSION_PREFIX, &[0, b'\n', b' '])
 }
 
 /// Extract custom error codes from program data
@@ -287,10 +288,4 @@ pub fn extract_custom_error_codes(program_data: &[u8]) -> Result<HashMap<u32, St
     }
     
     Ok(error_codes)
-}
-
-// Helper function to find string patterns
-fn find_string(data: &[u8], pattern: &[u8]) -> bool {
-    data.windows(pattern.len())
-        .any(|window| window == pattern)
 } 

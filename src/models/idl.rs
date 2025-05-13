@@ -40,6 +40,10 @@ pub struct Error {
 /// Program metadata
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Metadata {
+    /// Program name
+    pub metadata_name: String,
+    /// Program version
+    pub metadata_version: String,
     /// Program address
     pub address: String,
     /// Program origin (native, anchor, etc.)
@@ -56,13 +60,15 @@ impl IDL {
     /// Create a new IDL
     pub fn new(name: String, program_id: String) -> Self {
         Self {
-            name,
+            name: name.clone(),
             version: "0.1.0".to_string(),
             program_id,
             instructions: Vec::new(),
             accounts: Vec::new(),
             errors: Vec::new(),
             metadata: Metadata {
+                metadata_name: name,
+                metadata_version: "0.1.0".to_string(),
                 address: "".to_string(),
                 origin: "".to_string(),
                 framework_version: None,
@@ -201,6 +207,8 @@ impl Metadata {
     /// Create new metadata
     pub fn new(address: String, origin: String) -> Self {
         Self {
+            metadata_name: String::new(),
+            metadata_version: "0.1.0".to_string(),
             address,
             origin,
             framework_version: None,

@@ -4,6 +4,7 @@ use anyhow::Result;
 use crate::models::instruction::Instruction;
 use super::parser::SbfInstruction;
 use super::discriminator_detection::AnchorDiscriminator;
+use log;
 
 /// Find instruction boundaries in the program
 pub fn find_instruction_boundaries(instructions: &[SbfInstruction]) -> Result<Vec<usize>> {
@@ -25,6 +26,12 @@ pub fn find_instruction_boundaries(instructions: &[SbfInstruction]) -> Result<Ve
         boundaries.push(0);
     }
     
+    // Before the loop, ensure boundaries ends with instructions.len()
+    let mut boundaries = boundaries.clone();
+    if *boundaries.last().unwrap() != instructions.len() {
+        boundaries.push(instructions.len());
+    }
+    
     Ok(boundaries)
 }
 
@@ -43,14 +50,23 @@ pub fn extract_program_instructions(
         "stake", "unstake", "claim", "vote", "propose"
     ];
     
-    // For each boundary, create an instruction
-    for (i, &boundary) in boundaries.iter().enumerate() {
-        // Analyze instructions between boundaries to infer name
-        let instruction_slice = if i + 1 < boundaries.len() {
-            &instructions[boundary..boundaries[i + 1]]
-        } else {
-            &instructions[boundary..]
-        };
+    let instruction_size = 8;
+    for i in 0..boundaries.len() - 1 {
+        let start = boundaries[i];
+        let end = boundaries[i + 1];
+        if end > instructions.len() {
+            log::warn!("Boundary end {} out of range for instructions of length {}", end, instructions.len());
+            continue;
+        }
+        if start > end {
+            log::warn!("Boundary start {} greater than end {}", start, end);
+            continue;
+        }
+        if (end - start) % instruction_size != 0 {
+            log::warn!("Instruction slice from {} to {} is not aligned to instruction size {}", start, end, instruction_size);
+            continue;
+        }
+        let instruction_slice = &instructions[start..end];
         
         // Try to find a matching discriminator
         let discriminator = discriminators.iter()

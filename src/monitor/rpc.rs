@@ -349,7 +349,7 @@ pub async fn get_program_data(rpc_client: &RpcClient, program_id: &Pubkey) -> Re
                                             } 
                                             // Check if this is a regular executable program
                                             else {
-                                                let executable = result.get("executable")
+                                                let executable = result.get("executable") // from getAccountInfo
                                                     .and_then(|e| e.as_bool())
                                                     .unwrap_or(false);
                                                     

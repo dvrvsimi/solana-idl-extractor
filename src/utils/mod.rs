@@ -10,6 +10,7 @@ pub mod control_flow;
 pub mod error_analysis;
 pub mod dynamic_analysis;
 pub mod discriminator_detection;
+pub mod anchor;
 
 use solana_pubkey::Pubkey;
 

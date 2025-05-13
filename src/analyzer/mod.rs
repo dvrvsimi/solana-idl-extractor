@@ -5,15 +5,14 @@ pub mod anchor;
 pub mod patterns;
 pub mod simulation;
 
-#[cfg(test)]
-
 use solana_client::rpc_client::RpcClient;
 use anyhow;
 use crate::models::idl::IDL;
 use crate::monitor::Monitor;
 use crate::errors::ExtractorResult;
 use crate::errors::{ExtractorError, ErrorContext};
-use crate::analyzer::bytecode::parser::analyze_with_sbpf;
+use crate::analyzer::bytecode::extract_program_name;
+use crate::monitor::rpc::get_program_data;
 use solana_sbpf::insn_builder::Instruction; // use this instead for impl on l107
 
 // Re-export common types
@@ -23,7 +22,7 @@ pub use self::simulation::TransactionSimulator;
 
 /// Analyzer for Solana programs
 pub struct Analyzer {
-    // Configuration options could go here, feature toggles, analysis depth, etc.
+    // TODO: configuration options could go here, feature toggles, analysis depth, etc.
 }
 
 impl Analyzer {
@@ -45,18 +44,6 @@ impl Analyzer {
         
         log::debug!("Received program data, size: {} bytes", elf_bytes.len());
         
-        // Check if this looks like valid ELF data
-        if elf_bytes.len() >= 4 && elf_bytes[0] == 0x7F && elf_bytes[1] == b'E' && elf_bytes[2] == b'L' && elf_bytes[3] == b'F' {
-            let is_anchor = anchor::is_anchor_program(&elf_bytes);
-            if is_anchor {
-                log::info!("Detected Anchor program");
-            } else {
-                log::info!("Detected native Solana program");
-            }
-        } else {
-            log::warn!("Program data does not appear to be a valid ELF file");
-        } // is this validation still needed?
-        
         // Analyze bytecode
         let result = bytecode::analyze(&elf_bytes, &program_id.to_string())
             .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
@@ -73,8 +60,173 @@ impl Analyzer {
         
         result
     }
+
+    /// Analyze a Solana program and extract its IDL
+    pub async fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
+        log::info!("Analyzing program: {}", program_id);
+        
+        // Get program data
+        let program_data = get_program_data(rpc_client, program_id).await?;
+        
+        // Check if this is an Anchor program
+        let is_anchor = anchor::is_anchor_program(&program_data);
+        
+        let mut idl = if is_anchor {
+            log::info!("Detected Anchor program, using specialized analysis");
+            match anchor::analyze(program_id, &program_data).map_err(|e| ExtractorError::from_anyhow(e, ErrorContext {
+                program_id: Some(program_id.to_string()),
+                component: "analyzer".to_string(),
+                operation: "analyze_anchor".to_string(),
+                details: None,
+            })) {
+                Ok(analysis) => {
+                    let mut idl = IDL::new(
+                        format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+                        program_id.to_string()
+                    );
+                    
+                    // Add instructions
+                    for instruction in analysis.instructions {
+                        idl.add_instruction(instruction);
+                    }
+                    
+                    // Add accounts
+                    for account in analysis.accounts {
+                        idl.add_account(account);
+                    }
+                    
+                    // Add error codes
+                    for (code, name) in analysis.error_codes {
+                        idl.add_error(code, name.clone(), name);
+                    }
+                    
+                    // Set metadata
+                    idl.metadata.address = program_id.to_string();
+                    idl.metadata.origin = "anchor".to_string();
+                    
+                    idl
+                },
+                Err(e) => {
+                    log::warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
+                    // Fall back to bytecode analysis
+                    let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
+                        .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                            program_id: Some(program_id.to_string()),
+                            component: "analyzer".to_string(),
+                            operation: "analyze_program".to_string(),
+                            details: Some("anchor_fallback".to_string()),
+                        }))?;
+                    
+                    let mut idl = IDL::new(
+                        format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+                        program_id.to_string()
+                    );
+                    
+                    // Add instructions
+                    for instruction in bytecode_analysis.instructions {
+                        idl.add_instruction(instruction);
+                    }
+                    
+                    // Add accounts
+                    for account in bytecode_analysis.accounts {
+                        idl.add_account(account);
+                    }
+                    
+                    // Set metadata
+                    idl.metadata.address = program_id.to_string();
+                    idl.metadata.origin = "native".to_string();
+                    
+                    idl
+                }
+            }
+        } else {
+            // Analyze bytecode
+            let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
+                .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                    program_id: Some(program_id.to_string()),
+                    component: "analyzer".to_string(),
+                    operation: "analyze_program".to_string(),
+                    details: Some("native_analysis".to_string()),
+                }))?;
+            
+            let mut idl = IDL::new(
+                format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
+                program_id.to_string()
+            );
+            
+            // Add instructions
+            for instruction in bytecode_analysis.instructions {
+                idl.add_instruction(instruction);
+            }
+            
+            // Add accounts
+            for account in bytecode_analysis.accounts {
+                idl.add_account(account);
+            }
+            
+            // Set metadata
+            idl.metadata.address = program_id.to_string();
+            idl.metadata.origin = "native".to_string();
+            
+            idl
+        };
+        
+        // Enhance IDL with Anchor-specific information if applicable
+        if is_anchor {
+            if let Err(e) = anchor::enhance_idl(&mut idl, &program_data)
+                .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
+                    program_id: Some(program_id.to_string()),
+                    component: "analyzer".to_string(),
+                    operation: "enhance_idl".to_string(),
+                    details: None,
+                })) {
+                log::warn!("Failed to enhance IDL with Anchor information: {}", e);
+            }
+        }
+        
+        Ok(idl)
+    }
     
-    /// Analyze transaction patterns
+    
+    /// Build IDL from analysis results
+    pub async fn build_idl(
+        &self, 
+        program_id: &solana_pubkey::Pubkey, 
+        program_data: &[u8], 
+        bytecode_analysis: BytecodeAnalysis, 
+        pattern_analysis: PatternAnalysis // TODO: use this to further enrich the IDL
+    ) -> ExtractorResult<IDL> {
+        // Use extracted program name if possible
+        let program_name = extract_program_name(program_data)
+            .unwrap_or_else(|_| format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()));
+
+        let mut idl = IDL::new(program_name.clone(), program_id.to_string());
+
+        // Add instructions from bytecode analysis
+        for ix in &bytecode_analysis.instructions {
+            idl.add_instruction(ix.clone());
+        }
+
+        // Add accounts from bytecode analysis
+        for acc in &bytecode_analysis.accounts {
+            idl.add_account(acc.clone());
+        }
+
+        // Add error codes from bytecode analysis
+        for (code, name) in &bytecode_analysis.error_codes {
+            idl.add_error(*code, name.clone(), name.clone());
+        }
+
+        // Set metadata name and notes
+        idl.metadata.metadata_name = program_name;
+        idl.metadata.notes = Some("Extracted from native Solana program".to_string());
+
+        // TODO: Use pattern_analysis to further enrich the IDL if needed
+
+        Ok(idl)
+    }
+
+    /// Analyze transaction patterns, TODO: improve this
     pub async fn analyze_patterns(&self, program_id: &solana_pubkey::Pubkey, monitor: &Monitor) -> ExtractorResult<patterns::PatternAnalysis> {
         // Get recent transactions
         let transactions = monitor.get_recent_transactions(program_id).await
@@ -95,71 +247,7 @@ impl Analyzer {
             }))
     }
     
-    /// Build IDL from analysis results
-    pub async fn build_idl(&self, program_id: &solana_pubkey::Pubkey, program_data: &[u8], bytecode_analysis: BytecodeAnalysis, pattern_analysis: PatternAnalysis) -> ExtractorResult<IDL> {
-        let mut idl = IDL::new(
-            format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-            program_id.to_string()
-        );
-
-        // Use official SBPF analysis for better instruction detection
-        let sbpf_instructions = crate::analyzer::bytecode::parser::analyze_with_sbpf(program_data)?;
-
-        // Group instructions using official analysis patterns
-        let mut current_instruction: Option<crate::models::instruction::Instruction> = None;
-        let mut idl_instructions: Vec<crate::models::instruction::Instruction> = Vec::new();
-
-        for instruction in &sbpf_instructions {
-            if instruction.is_instruction_handler() {
-                // Start new instruction group
-                if let Some(complete_instruction) = current_instruction.take() {
-                    idl_instructions.push(complete_instruction);
-                }
-                // Use discriminator value for instruction name
-                let name = if instruction.is_discriminator_check() {
-                    format!("instruction_{}", instruction.imm)
-                } else {
-                    format!("instruction_{}", idl_instructions.len())
-                };
-                current_instruction = Some(crate::models::instruction::Instruction::new(name, idl_instructions.len() as u8));
-            }
-            // Add accounts and parameters based on instruction patterns
-            if let Some(ref mut current) = current_instruction {
-                if instruction.is_account_validation() {
-                    current.add_account(
-                        format!("account_{}", current.accounts.len()),
-                        true,  // Is signer - can be refined based on checks
-                        true,  // Is writable - can be refined based on checks
-                        false  // Not optional by default
-                    );
-                }
-                if instruction.is_parameter_loading() {
-                    let param_type = match instruction.size {
-                        1 => "u8",
-                        2 => "u16",
-                        4 => "u32",
-                        8 => "u64",
-                        _ => "bytes"
-                    };
-                    current.add_arg(
-                        format!("param_{}", current.args.len()),
-                        param_type.to_string()
-                    );
-                }
-            }
-        }
-        // Add final instruction if any
-        if let Some(instruction) = current_instruction {
-            idl_instructions.push(instruction);
-        }
-        // Add processed instructions to IDL
-        for instruction in idl_instructions {
-            idl.add_instruction(instruction);
-        }
-        Ok(idl)
-    }
-    
-    /// Build IDL with simulation results
+    /// Build IDL with simulation results, TODO: improve this
     pub async fn build_idl_with_simulation(
         &self, 
         program_id: &solana_pubkey::Pubkey, 
@@ -225,157 +313,7 @@ impl Analyzer {
         
         Ok(idl)
     }
+
+
 }
 
-/// Analyze a Solana program and extract its IDL
-pub async fn analyze_program(program_id: &solana_pubkey::Pubkey, rpc_client: &RpcClient) -> ExtractorResult<IDL> {
-    log::info!("Analyzing program: {}", program_id);
-    
-    // Get program data
-    let program_data = get_program_data(rpc_client, program_id).await?;
-    
-    // Check if this is an Anchor program
-    let is_anchor = anchor::is_anchor_program(&program_data);
-    
-    let mut idl = if is_anchor {
-        log::info!("Detected Anchor program, using specialized analysis");
-        match anchor::analyze(program_id, &program_data).map_err(|e| ExtractorError::from_anyhow(e, ErrorContext {
-            program_id: Some(program_id.to_string()),
-            component: "analyzer".to_string(),
-            operation: "analyze_anchor".to_string(),
-            details: None,
-        })) {
-            Ok(analysis) => {
-                let mut idl = IDL::new(
-                    format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-                    program_id.to_string()
-                );
-                
-                // Add instructions
-                for instruction in analysis.instructions {
-                    idl.add_instruction(instruction);
-                }
-                
-                // Add accounts
-                for account in analysis.accounts {
-                    idl.add_account(account);
-                }
-                
-                // Add error codes
-                for (code, name) in analysis.error_codes {
-                    idl.add_error(code, name.clone(), name);
-                }
-                
-                // Set metadata
-                idl.metadata.address = program_id.to_string();
-                idl.metadata.origin = "anchor".to_string();
-                
-                idl
-            },
-            Err(e) => {
-                log::warn!("Anchor analysis failed: {}, falling back to bytecode analysis", e);
-                // Fall back to bytecode analysis
-                let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
-                    .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-                        program_id: Some(program_id.to_string()),
-                        component: "analyzer".to_string(),
-                        operation: "analyze_program".to_string(),
-                        details: Some("anchor_fallback".to_string()),
-                    }))?;
-                
-                let mut idl = IDL::new(
-                    format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-                    program_id.to_string()
-                );
-                
-                // Add instructions
-                for instruction in bytecode_analysis.instructions {
-                    idl.add_instruction(instruction);
-                }
-                
-                // Add accounts
-                for account in bytecode_analysis.accounts {
-                    idl.add_account(account);
-                }
-                
-                // Set metadata
-                idl.metadata.address = program_id.to_string();
-                idl.metadata.origin = "native".to_string();
-                
-                idl
-            }
-        }
-    } else {
-        // Analyze bytecode
-        let bytecode_analysis = bytecode::analyze(&program_data, &program_id.to_string())
-            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-                program_id: Some(program_id.to_string()),
-                component: "analyzer".to_string(),
-                operation: "analyze_program".to_string(),
-                details: Some("native_analysis".to_string()),
-            }))?;
-        
-        let mut idl = IDL::new(
-            format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-            program_id.to_string()
-        );
-        
-        // Add instructions
-        for instruction in bytecode_analysis.instructions {
-            idl.add_instruction(instruction);
-        }
-        
-        // Add accounts
-        for account in bytecode_analysis.accounts {
-            idl.add_account(account);
-        }
-        
-        // Set metadata
-        idl.metadata.address = program_id.to_string();
-        idl.metadata.origin = "native".to_string();
-        
-        idl
-    };
-    
-    // Enhance IDL with Anchor-specific information if applicable
-    if is_anchor {
-        if let Err(e) = anchor::enhance_idl(&mut idl, &program_data)
-            .map_err(|e| ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-                program_id: Some(program_id.to_string()),
-                component: "analyzer".to_string(),
-                operation: "enhance_idl".to_string(),
-                details: None,
-            })) {
-            log::warn!("Failed to enhance IDL with Anchor information: {}", e);
-        }
-    }
-    
-    Ok(idl)
-}
-
-/// Get program data from the blockchain
-async fn get_program_data(rpc_client: &RpcClient, program_id: &solana_pubkey::Pubkey) -> ExtractorResult<Vec<u8>> {
-    log::info!("Fetching program data for: {}", program_id);
-    
-    // Create a monitor to use the robust implementation
-    let monitor = match crate::monitor::Monitor::new(rpc_client.url().as_str()).await {
-        Ok(m) => m,
-        Err(e) => return Err(ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-            program_id: Some(program_id.to_string()),
-            component: "analyzer".to_string(),
-            operation: "get_program_data".to_string(),
-            details: Some("create_monitor".to_string()),
-        })),
-    };
-    
-    // Use the monitor's implementation which correctly handles BPF upgradeable loader accounts
-    match monitor.get_program_data(program_id).await {
-        Ok(data) => Ok(data),
-        Err(e) => Err(ExtractorError::from_anyhow(anyhow::anyhow!("{}", e), ErrorContext {
-            program_id: Some(program_id.to_string()),
-            component: "analyzer".to_string(),
-            operation: "get_program_data".to_string(),
-            details: None,
-        })),
-    }
-}

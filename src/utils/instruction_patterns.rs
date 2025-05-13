@@ -19,7 +19,8 @@ pub fn is_instruction_handler(instruction: &SbfInstruction) -> bool {
             // Look for syscall patterns
             if instruction.opcode == opcodes::CALL && instruction.imm >= 0x100000 {
                 return true;
-            } // TODO: complete the conditional
+            }
+            false
         }
         InstructionClass::MemoryLoadOr32BitALU => {
             // Look for account data loading patterns
@@ -31,8 +32,9 @@ pub fn is_instruction_handler(instruction: &SbfInstruction) -> bool {
                 // Check for instruction data access (8 bytes for discriminator)
                 if instruction.size == 8 && instruction.offset == 0 {
                     return true;
-                } // TODO: complete the conditional
+                }
             }
+            false
         }
         _ => false
     }

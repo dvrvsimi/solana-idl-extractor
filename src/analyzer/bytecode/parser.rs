@@ -30,6 +30,7 @@ use crate::utils::memory_analysis::{
     is_load,
     is_store,
 };
+use std::fmt::Write as FmtWrite;
 
 /// Memory access type for SBF instructions
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -459,9 +460,24 @@ impl SbfInstruction {
 
 /// Parse instructions using official SBPF tools
 pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<Vec<SbfInstruction>> {
+    // Debug: print length and a sample hexdump
+    log::info!("Parsing instructions: data length = {}", data.len());
+    let sample_len = data.len().min(32);
+    let mut hex_sample = String::new();
+    for b in &data[..sample_len] {
+        write!(&mut hex_sample, "{:02x} ", b).unwrap();
+    }
+    log::info!("First {} bytes: {}", sample_len, hex_sample);
+
+    // Defensive: only parse multiples of 8 bytes
+    if data.len() % 8 != 0 {
+        log::warn!("Instruction data length {} is not a multiple of 8, truncating", data.len());
+    }
+    let valid_len = data.len() - (data.len() % 8);
+    let data = &data[..valid_len];
+
     // Parse instructions manually without using Executable
     let mut instructions = Vec::new();
-    
     for i in (0..data.len()).step_by(8) {
         if i + 8 <= data.len() {
             match SbfInstruction::parse(&data[i..i+8], base_address + i) {
@@ -473,7 +489,6 @@ pub fn parse_instructions(data: &[u8], base_address: usize) -> ExtractorResult<V
             }
         }
     }
-    
     Ok(instructions)
 }
 

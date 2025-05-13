@@ -1,6 +1,6 @@
 //! Transaction monitoring for Solana programs
 
-mod rpc;
+pub mod rpc;
 pub mod transaction;
 
 use anyhow::Result;

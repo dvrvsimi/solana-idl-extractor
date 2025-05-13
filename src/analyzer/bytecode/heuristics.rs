@@ -1,8 +1,20 @@
 //! Documentation of heuristics and assumptions used in IDL extraction
 //!
-//! This module documents the various heuristics and assumptions used
-//! throughout the IDL extraction process. Understanding these is crucial
-//! for interpreting the results and improving the extraction algorithms.
+//! NOTE: This file is for documentation purposes only and is not used in the codebase.
+//! The actual heuristics are implemented in the following modules:
+//!   - `src/analyzer/patterns.rs` (transaction and instruction pattern analysis)
+//!   - `src/analyzer/bytecode/string_analyzer.rs` (string and name extraction)
+//!   - `src/analyzer/bytecode/parser.rs` (bytecode parsing and instruction detection)
+//!   - `src/analyzer/bytecode/account_analyzer.rs` (account structure extraction)
+//!   - `src/analyzer/bytecode/discriminator_detection.rs` (discriminator logic)
+//!   - `src/utils/instruction_patterns.rs` (instruction pattern heuristics)
+//!   - `src/utils/error_analysis.rs` (error code heuristics)
+//!   - `src/utils/account_analysis.rs` (account heuristics)
+//!   - `src/utils/pattern.rs` (pattern matching utilities)
+//!
+//! This file is a living document to help developers understand and locate the heuristics used throughout the codebase.
+//!
+//! Understanding these is crucial for interpreting the results and improving the extraction algorithms.
 
 /// # Instruction Detection Heuristics
 ///
@@ -103,5 +115,8 @@
 // The tool should:
 // 1. Skip the first 8 bytes of the program data account
 // 2. Then try to parse the remaining bytes as an ELF file
+
+// program dump cmd: solana program dump TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb ./dumped.so hexdump -C ./dumped.so | head
+
 
 pub fn _dummy() {} 

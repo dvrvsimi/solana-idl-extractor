@@ -75,14 +75,18 @@ pub async fn extract_idl(
     let bytecode_analysis = analyzer.analyze_bytecode(program_id, &monitor).await
         .context("Failed to analyze bytecode")?;
     
-    // Analyze transaction patterns
+    // Analyze transaction patterns,  WIP
     let pattern_analysis = analyzer.analyze_patterns(program_id, &monitor).await
         .context("Failed to analyze transaction patterns")?;
+
+    // Fetch the ELF bytes
+    let elf_bytes = monitor.get_program_data(program_id).await
+    .context("Failed to fetch program ELF bytes")?;
     
     // Build IDL
-    let idl = analyzer.build_idl(program_id, bytecode_analysis, pattern_analysis)
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to build IDL: {}", e))?;
+    let idl = analyzer.build_idl(program_id, &elf_bytes, bytecode_analysis.clone(), pattern_analysis)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to build IDL: {}", e))?;
     
     // Save to cache
     if use_cache {
@@ -91,7 +95,7 @@ pub async fn extract_idl(
         }
     }
     
-    // Save to file if path provided
+    // Save to file if --output is specified
     if let Some(path) = output_path {
         generator::save_idl(&idl, path)
             .with_context(|| format!("Failed to save IDL to {}", path.display()))?;
@@ -102,7 +106,55 @@ pub async fn extract_idl(
     Ok(idl)
 }
 
-/// Extract IDL with simulation to enhance results
+
+
+/// Analyze a Solana program and extract its IDL
+pub fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
+    info!("Analyzing program: {}", program_id);
+
+    let program_name = analyzer::bytecode::extract_program_name(program_data)
+        .unwrap_or_else(|_| format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()));
+
+    if analyzer::anchor::is_anchor_program(program_data) {
+        info!("Detected Anchor program, using Anchor-specific analysis");
+        let anchor_analysis = analyzer::anchor::analyze(program_id, program_data)
+            .with_context(|| "Failed to analyze Anchor program")?;
+        let mut idl = models::idl::IDL::new(program_name, program_id.to_string());
+        for instruction in anchor_analysis.instructions {
+            idl.add_instruction(instruction);
+        }
+        for account in anchor_analysis.accounts {
+            idl.add_account(account);
+        }
+        for (code, name) in anchor_analysis.error_codes {
+            idl.add_error(code, name.clone(), name);
+        }
+        idl.metadata.address = program_id.to_string();
+        idl.metadata.origin = "anchor".to_string();
+        analyzer::anchor::enhance_idl(&mut idl, program_data)?;
+        Ok(idl)
+
+    } else { // non anchor analysis
+        let bytecode_analysis = analyzer::bytecode::analyze(program_data, &program_id.to_string())
+            .with_context(|| "Failed to analyze program bytecode")?;
+        let mut idl = models::idl::IDL::new(program_name, program_id.to_string());
+        for instruction in bytecode_analysis.instructions {
+            idl.add_instruction(instruction);
+        }
+        for account in bytecode_analysis.accounts {
+            idl.add_account(account);
+        }
+        for (code, name) in bytecode_analysis.error_codes {
+            idl.add_error(code, name.clone(), name);
+        }
+        idl.metadata.address = program_id.to_string();
+        idl.metadata.origin = "native".to_string();
+        Ok(idl)
+    }
+}
+
+
+/// Extract IDL with simulation to enhance results, WIP too
 pub async fn extract_idl_with_simulation(
     program_id: &Pubkey,
     rpc_url: &str,
@@ -194,86 +246,3 @@ pub async fn extract_idl_with_simulation(
     
     Ok(idl)
 }
-
-/// Analyze a Solana program and extract its IDL
-pub fn analyze_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
-    info!("Analyzing program: {}", program_id);
-    
-    // First, check if this is an Anchor program
-    if analyzer::anchor::is_anchor_program(program_data) {
-        info!("Detected Anchor program, using Anchor-specific analysis");
-        return analyze_anchor_program(program_id, program_data);
-    }
-    
-    // If not Anchor, use the general bytecode analyzer
-    let bytecode_analysis = analyzer::bytecode::analyze(program_data, &program_id.to_string())
-        .with_context(|| "Failed to analyze program bytecode")?;
-    
-    // Create IDL
-    let mut idl = models::idl::IDL::new(
-        format!("program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-        program_id.to_string()
-    );
-    
-    // Add instructions
-    for instruction in bytecode_analysis.instructions {
-        idl.add_instruction(instruction);
-    }
-    
-    // Add accounts
-    for account in bytecode_analysis.accounts {
-        idl.add_account(account);
-    }
-    
-    // Add error codes
-    for (code, name) in bytecode_analysis.error_codes {
-        idl.add_error(code, name.clone(), name);
-    }
-    
-    // Add metadata
-    idl.metadata.address = program_id.to_string();
-    idl.metadata.origin = "native".to_string();
-    
-    Ok(idl)
-}
-
-/// Analyze an Anchor program and extract its IDL
-fn analyze_anchor_program(program_id: &Pubkey, program_data: &[u8]) -> Result<models::idl::IDL> {
-    info!("Analyzing Anchor program: {}", program_id);
-    
-    // Use Anchor-specific analysis
-    let anchor_analysis = analyzer::anchor::analyze(program_id, program_data)
-        .with_context(|| "Failed to analyze Anchor program")?;
-    
-    // Create IDL
-    let mut idl = models::idl::IDL::new(
-        format!("anchor_program_{}", program_id.to_string().chars().take(10).collect::<String>()), 
-        program_id.to_string()
-    );
-    
-    // Add instructions
-    for instruction in anchor_analysis.instructions {
-        idl.add_instruction(instruction);
-    }
-    
-    // Add accounts
-    for account in anchor_analysis.accounts {
-        idl.add_account(account);
-    }
-    
-    // Add error codes
-    for (code, name) in anchor_analysis.error_codes {
-        idl.add_error(code, name.clone(), name);
-    }
-    
-    // Add metadata
-    idl.metadata.address = program_id.to_string();
-    idl.metadata.origin = "anchor".to_string();
-    
-    // Enhance IDL with additional Anchor-specific information
-    analyzer::anchor::enhance_idl(&mut idl, program_data)?;
-
-    // program dump cmd: solana program dump TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb ./dumped.so hexdump -C ./dumped.so | head
-    
-    Ok(idl)
-} 

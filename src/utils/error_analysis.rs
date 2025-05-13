@@ -237,27 +237,25 @@ pub fn analyze_error_handling(
     }
     
     // Verify error handling
-    verify_error_handling(instructions, analysis)?;
+    verify_error_handling(instructions, &result.error_codes)?;
     
     Ok(result)
 }
 
 /// Add verification
-fn verify_error_handling(instructions: &[SbfInstruction], analysis: &Analysis) -> Result<()> {
-    // Verify that error handlers are properly terminated
-    for &handler_idx in &analysis.error_handlers { // TODO: see source for the right field that handles errors, this should be sbpf's
-        if !instructions[handler_idx..].iter().any(|insn| insn.is_exit()) {
-            return Err(anyhow::anyhow!("Error handler at {} is not properly terminated", handler_idx));
-        }
-    }
-    
-    // Verify that error codes are properly handled
-    for (code, _) in &analysis.error_codes { // TODO: see source for the right field that handles errors
+///
+/// error_codes: HashMap of error codes to check for usage in the instructions.
+fn verify_error_handling(
+    instructions: &[SbfInstruction],
+    error_codes: &std::collections::HashMap<u32, String>,
+) -> Result<()> {
+    // TODO: Advanced: Analyze control flow to find error handler blocks
+    // For now, only verify that error codes are properly handled
+    for code in error_codes.keys() {
         if !instructions.iter().any(|insn| insn.is_mov_imm() && insn.imm == *code as i64) {
             return Err(anyhow::anyhow!("Error code {} is defined but never used", code));
         }
     }
-    
     Ok(())
 }
 
